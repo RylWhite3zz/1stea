@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "allegro-probe"
+version = "0.1.0"
+description = "MuJoCo probe primitives executed by a simulated Wonik Allegro hand"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mujoco>=3.1",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+allegro-probe-demo = "examples.run_probe_demo:main"
+
+[tool.setuptools.packages.find]
+include = ["allegro_probe*", "examples*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
