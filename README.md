@@ -1,121 +1,172 @@
 # AllegroProbe
 
-这个目录从 ProbeBench 中独立出来，只负责一件事：在 MuJoCo 中控制
-Wonik Allegro 灵巧手执行 probe，并把仿真传感器数据整理成结构化特征。
+AllegroProbe 是 ProbeBench 的 MuJoCo probe 执行层。它接收一个明确的
+`ProbeCommand`，执行接近、接触、有效性检查和 probe 原语，并返回带诊断信息的
+`ProbeResult`。它不读取隐藏属性来选择答案。
 
-当前实现的 primitive：
+v1 限定为四个 family/primitive：
 
-| hidden family | primitive | 主要信号 |
+| hidden family | primitive | 主要可信信号 |
 | --- | --- | --- |
-| stiffness | `poke` | 探针法向力、压入量、估计刚度 |
-| mass | `heft` | 腕部 z 向力、抬升状态、估计质量 |
-| fill | `shake` | 腕部力矩、晃动响应、填充代理特征 |
-| material | `slide` | 法向力、切向力、估计摩擦系数 |
+| stiffness | `poke` | 法向力—压入量曲线、估计刚度 |
+| mass | `heft` | 脱离支撑后的 baseline-corrected 腕部力 |
+| fill | `shake` | 通过 heft gate 后的腕部力矩动态响应 |
+| material | `slide` | preload 闭环下的切向/法向力比 |
 
-`poke` 和 `slide` 使用腕部中央的仪器化探针；`heft` 和 `shake` 使用
-Menagerie Allegro 的真实关节、碰撞体和位置执行器完成抓取。传感器包括
-指尖触碰、腕部 force/torque、探针 force/touch、关节位置/速度和物体位姿。
+## 执行后端
 
-## 边界
+两个后端共享相同命令、状态机、传感语义和结果结构：
 
-本项目目前是 probe 执行层，不是完整 benchmark，也不是完整机器人 agent。
+| backend | `poke/slide` | `heft/shake` |
+| --- | --- | --- |
+| `reference` | 中央仪器化探针 | 带底缘承托钩的双指参考夹爪 |
+| `allegro` | 中央仪器化探针 | Menagerie Wonik Allegro 真正的关节和碰撞体 |
 
-- 已实现：MuJoCo 场景、Allegro 低层位置控制、四种 probe 状态机、feature
-  提取、被动 viewer。
-- 仅有协议示意：`VLMPolicy`、`ProbeCommand`、`ManipulationCommand` 和
-  `ManipulationController`，见 `allegro_probe/interfaces.py`。
-- 尚未设计：图像/历史如何编码给 VLM、VLM 如何选择下一次 probe、终止
-  probe 的策略、OpenAI 多模态消息格式、最终 manipulation 动作空间与成功判定。
-- 不包含：ProbeBench split、数据集、评分、leaderboard、belief model 或
-  根据隐藏真值自动选答案的 reference policy。
-
-因此当前可调用边界只有：
+创建后端：
 
 ```python
-result = ProbeHarness(scene).execute(
-    ProbeCommand(primitive="heft", target=1)
+from allegro_probe import (
+    AllegroHandBackend,
+    ProbeCommand,
+    ProbeHarness,
+    ReferenceProbeBackend,
+    make_demo_scene,
 )
+
+task = make_demo_scene("mass", n_candidates=3, seed=0)
+backend = ReferenceProbeBackend.create(task)
+result = ProbeHarness(backend).execute(ProbeCommand("heft", target=1))
 ```
 
-未来 VLM 应输出 `ProbeCommand`，harness 执行后再把 `ProbeResult` 和视觉观测
-交还给 VLM。最终 manipulation 需要另一套控制器和评测定义，现在不做假设。
+旧的 `ProbeHarness(AllegroProbeScene(...))` 调用仍然支持，scene 会根据
+`SceneConfig.backend` 自动适配为对应 backend。
 
-## 依赖
+## 控制与有效性
+
+四种原语统一采用显式分阶段控制：
+
+```text
+approach
+→ guarded contact/descent
+→ contact establishment
+→ contact quality gate
+→ primitive execution
+→ post-check
+→ retreat
+```
+
+这里的 wrist 是 MuJoCo 中的 6-DoF task-space carriage：`x/y/z + roll/tilt/yaw`。
+各阶段在预先定义的目标位姿之间平滑插值，并根据接触、力和超时条件转移。它不是
+机械臂、IK、关节空间避碰或 MPC 规划。
+
+关键 gate：
+
+- `poke`：以 `probe_force` 法向分量闭环，touch 作为接触 guard；达到目标力或
+  最大安全压入量后才形成有效曲线。
+- `slide`：PI 维持法向 preload，允许短时 touch 失联恢复；路径完成率和有效接触
+  占比都达标后才有效。
+- `heft`：`pregrasp → grasp → bounded squeeze → lift`；要求 Allegro 的拇指与
+  至少一个对向手指（或 reference 左右夹爪）形成接触，物体脱离 pedestal/table，
+  相对腕部稳定且穿透受限。
+- `shake`：必须先通过与 heft 相同的抓取和脱离支撑 gate；shake 过程中重新接触
+  支撑、持续丢失对向接触或掉落都会使结果无效。
+
+mass/fill 物体初始放在小型中央 pedestal 上。pedestal 比物体底面窄，不带四周
+挡墙，因此腰部、凸缘和底面外圈对侧向手指开放。物体在 reset/抓取阶段可以受
+pedestal 支撑，但进入 heft/shake 测量前必须连续确认 pedestal/table 接触消失。
+
+碰撞角色在 scene 编译时固定：
+
+- stiffness/material scene 启用中央 probe 碰撞。
+- mass/fill scene 禁用中央 probe 碰撞并启用对应 gripper/hand。
+- primitive 运行期间不通过切换 `contype/conaffinity` 制造穿模捷径。
+
+## ProbeResult
+
+`ProbeResult` 将执行有效性和属性 feature 分开：
+
+```text
+status / controller_status   控制结果
+valid                        feature 是否可作为可信 probe 信号
+phase_reached                最后到达的状态机阶段
+violations                   超力、失联、穿透、支撑接触、滑移等
+quality                      路径完成率、接触组、漂移、抬升距离等
+features                     属性相关结构化特征
+raw_summary                  baseline 和简要诊断
+trace                        可选完整时序
+```
+
+控制失败时，质量、刚度、填充或摩擦估计不会被伪装成成功 feature。`to_dict()`
+默认不展开时序；使用 `to_dict(include_trace=True)` 可包含 trace。
+
+## 传感器
+
+统一传感包括：
+
+- `probe_touch`、`probe_force`、`probe_framepos`
+- `wrist_force`、`wrist_torque`、wrist pose
+- wrist 六轴 joint position/velocity
+- 物体 position/quaternion
+- Allegro fingertip touch/position、actuator force、`jointactuatorfrc`
+- reference 左右夹爪 touch 和 `jointactuatorfrc`
+- 直接从 MuJoCo contact buffer 得到的手指分组、pedestal/table 接触、法向力和
+  penetration
+
+## 运行
+
+依赖：
 
 - Python 3.10+
 - MuJoCo 3.1+
 - NumPy
-- MuJoCo Menagerie 的 `wonik_allegro/right_hand.xml`
+- Allegro 后端需要 MuJoCo Menagerie 的 `wonik_allegro/right_hand.xml`
 
-本机默认模型路径：
+默认 Menagerie 路径：
 
 ```text
 /home/enovo/robots/sim/mujoco_menagerie/wonik_allegro
 ```
 
-也可以通过 `--menagerie-root` 指定。
-
-## 运行
-
-在本目录执行：
+示例：
 
 ```bash
 conda activate probebench
 python -m pip install -e .
+
 python -m examples.run_probe_demo \
+  --backend reference \
   --family mass \
   --candidates 3 \
   --reset-between-probes
-```
 
-显示 MuJoCo 画面：
-
-```bash
 python -m examples.run_probe_demo \
-  --family mass \
+  --backend allegro \
+  --family fill \
   --candidates 3 \
   --reset-between-probes \
-  --viewer \
-  --hold-open
+  --viewer
 ```
 
-四类任务可分别使用 `stiffness`、`mass`、`fill`、`material`。演示程序会对
-所有候选物体执行对应 probe 并打印 feature，但不会替 VLM 做选择，也不会
-执行后续 manipulation。
+添加 `--include-trace` 会在 JSON 中输出完整时序。
 
-## 目录
+运行测试：
 
-```text
-allegro_probe/
-  scene.py          MuJoCo XML 装配、Allegro 控制、传感器读取
-  primitives.py     poke/heft/shake/slide
-  models.py         场景、物体和 probe 结果数据结构
-  interfaces.py     尚未落地的 VLM/manipulation 宏观协议
-  demo_scenes.py    仅用于运行 probe 的简单几何体
-examples/
-  run_probe_demo.py
-tests/
+```bash
+python -m pytest -q
 ```
 
-当前手腕轨迹和抓取姿态是针对这些简单几何体调出的固定控制序列，还不是
-通用 IK、运动规划或鲁棒抓取系统。换物体尺寸、位置和随机种子后需要重新验证。
-当前 feature 也没有做跨场景物理标定，例如 `m_est_kg` 会混入手部和腕部
-动力学影响，应先视为用于同场景比较的质量代理，而不是可靠的绝对测量值。
+测试覆盖两个 backend、三个随机 seed、四种 primitive 的有效执行和物理排序，
+并包含无效抓取、未完成 slide、固定碰撞角色、6-DoF wrist 和脱离支撑检查。
 
+## 边界
 
-当前配置：
-| 任务 | 主要碰撞体 | 读取信号 |
-|---|---|---|
-| stiffness / poke | 中央 `probe_tip_geom` 与物体 | `probe_touch`、`probe_force` |
-| material / slide | 中央 `probe_tip_geom` 与物体 | 法向 touch、探针三轴 force |
-| mass / heft | Allegro 中段、远端、指尖碰撞体 | 腕部 force、指尖 touch、物体位姿 |
-| fill / shake | Allegro 中段、远端、指尖碰撞体 | 腕部 force/torque、指尖 touch、物体位姿 |
+本仓库仍然只是执行层：
 
+- 不包含 ProbeBench split、评分、leaderboard 或 belief model。
+- 不设计 VLM 图像/历史编码、probe 选择和停止策略。
+- 不包含最终 manipulation 动作空间或成功判定。
+- 不包含机械臂、IK、运动规划或任意 mesh 的通用抓取。
+- v1 对象是为可重复 probe 设计的解析几何和 stiffness/slosh proxy。
 
-另外：
-手掌、基座和近端指节碰撞被关闭，但视觉 mesh 仍显示。
-poke/slide 时 Allegro 的有效碰撞体没有关闭，只是主要接触由中央探针完成。
-heft/shake 时会关闭中央探针碰撞，避免它干扰抓取。
-隐藏液体球的碰撞关闭，液体效果仅通过内部滑动关节和惯性模拟。
-桌面、托架和物体几何体也都参与碰撞。
-所以目前不是“每个任务只启用指定传感器”，而是按任务切换主要执行碰撞体，但场景中仍有其他碰撞体存在。
+DexJoCo 只用于参考 task-space pose/hand action 的接口分层；DexGraspBench 只用于
+参考分阶段抓取和接触质量检查。本项目不依赖或导入这两个仓库。

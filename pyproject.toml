@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "allegro-probe"
 version = "0.1.0"
-description = "MuJoCo probe primitives executed by a simulated Wonik Allegro hand"
+description = "Validated MuJoCo probe primitives with reference-rig and Allegro-hand backends"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Protocol
 
+from allegro_probe.backends import ProbeBackend, as_backend
 from allegro_probe.models import ProbeResult
 from allegro_probe.primitives import run_probe
 from allegro_probe.scene import AllegroProbeScene
@@ -47,12 +48,13 @@ class ManipulationController(Protocol):
 class ProbeHarness:
     """The currently implemented high-level boundary: execute one probe command."""
 
-    def __init__(self, scene: AllegroProbeScene):
-        self.scene = scene
+    def __init__(self, executor: ProbeBackend | AllegroProbeScene):
+        self.backend = as_backend(executor)
+        self.scene = self.backend.scene
 
     def execute(self, command: ProbeCommand) -> ProbeResult:
         return run_probe(
-            self.scene,
+            self.backend,
             primitive=command.primitive,
             target=command.target,
             **command.params,

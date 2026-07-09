@@ -10,6 +10,7 @@ import numpy as np
 
 FAMILIES = ("stiffness", "mass", "fill", "material")
 FAMILY_ALIASES = {"smoothness": "material"}
+BACKENDS = ("reference", "allegro")
 
 
 def canonical_family(family: str) -> str:
@@ -95,11 +96,18 @@ class ProbeResult:
     primitive: str
     features: Dict[str, float]
     status: str = "ok"
+    backend: str = "allegro"
+    valid: bool = True
+    controller_status: str = "ok"
+    phase_reached: str = "complete"
+    violations: List[str] = field(default_factory=list)
+    quality: Dict[str, float] = field(default_factory=dict)
     contact_seconds: float = 0.0
     params: Dict[str, Any] = field(default_factory=dict)
     raw_summary: Dict[str, Any] = field(default_factory=dict)
+    trace: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, include_trace: bool = False) -> Dict[str, Any]:
         def convert(value: Any) -> Any:
             if isinstance(value, np.ndarray):
                 return value.tolist()
@@ -113,4 +121,7 @@ class ProbeResult:
                 return [convert(item) for item in value]
             return value
 
-        return convert(asdict(self))
+        payload = asdict(self)
+        if not include_trace:
+            payload.pop("trace", None)
+        return convert(payload)

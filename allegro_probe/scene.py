@@ -1,8 +1,7 @@
-"""MuJoCo scene for Allegro-hand probe primitives.
+"""MuJoCo scene shared by reference-rig and Allegro probe backends.
 
-The scene embeds the MuJoCo Menagerie Wonik Allegro hand model under a movable wrist
-carriage. ``poke`` and ``slide`` use a central instrumented probe; ``heft`` and
-``shake`` use the articulated Allegro collision bodies.
+Both variants use a 6-DoF wrist carriage. ``poke`` and ``slide`` use an instrumented
+probe; ``heft`` and ``shake`` use either a reference gripper or articulated Allegro.
 """
 
 from __future__ import annotations
@@ -10,13 +9,13 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from allegro_probe.models import ObjectSpec, ProbeSceneSpec
+from allegro_probe.models import BACKENDS, ObjectSpec, ProbeSceneSpec
 
 
 DEFAULT_MENAGERIE_ROOT = Path("/home/enovo/robots/sim/mujoco_menagerie/wonik_allegro")
@@ -45,10 +44,28 @@ _ALLEGRO_CYLINDER_CLOSED = np.array([
 @dataclass
 class SceneConfig:
     menagerie_root: Path = DEFAULT_MENAGERIE_ROOT
-    candidate_spacing: float = 0.13
+    backend: str = "allegro"
+    candidate_spacing: float = 0.18
     palm_height: float = 0.34
     timestep: float = 0.002
     allegro_grasp_lift: float = 0.090
+
+    def __post_init__(self) -> None:
+        if self.backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS}, got {self.backend!r}")
+
+
+@dataclass(frozen=True)
+class ContactSnapshot:
+    """Contact facts used by primitive validity gates."""
+
+    hand_groups: Tuple[str, ...] = ()
+    hand_contact_count: int = 0
+    hand_normal_force_N: float = 0.0
+    support_contact: bool = False
+    support_normal_force_N: float = 0.0
+    table_contact: bool = False
+    max_penetration_m: float = 0.0
 
 
 def _fmt(vals) -> str:
@@ -116,20 +133,23 @@ def _allegro_sections(root: Path, visual_only: bool = True) -> Tuple[str, str, s
             "thumb_distal_collision",
             "thumbtip_collision",
         }
-        for geom in palm.iter("geom"):
-            cls = geom.attrib.get("class", "")
-            # In the probe benchmark we want object contact to come from the hand's grasping
-            # links, not broad palm/base collisions.  Keep medial/distal/tip geoms active so
-            # Allegro can form an actual wrap grasp; leave palm/base/proximal as visual only.
-            if "collision" in cls:
-                if cls in grasp_collision_classes:
-                    geom.set("friction", "2.8 0.06 0.004")
-                    geom.set("condim", "6")
-                    geom.set("priority", "3")
-                else:
-                    geom.set("contype", "0")
-                    geom.set("conaffinity", "0")
-                    geom.set("mass", "0")
+        for body in palm.iter("body"):
+            body_name = body.attrib.get("name", "hand")
+            for geom in body.findall("geom"):
+                cls = geom.attrib.get("class", "")
+                # Name collision proxies so contact gates never depend on anonymous geoms.
+                if "collision" in cls and "name" not in geom.attrib:
+                    geom.set("name", f"{body_name}_{cls}")
+                # Object contact comes from grasping links, not broad palm/base collisions.
+                if "collision" in cls:
+                    if cls in grasp_collision_classes:
+                        geom.set("friction", "3.5 0.06 0.004")
+                        geom.set("condim", "6")
+                        geom.set("priority", "3")
+                    else:
+                        geom.set("contype", "0")
+                        geom.set("conaffinity", "0")
+                        geom.set("mass", "0")
         if visual_only:
             _strip_joints(palm)
             palm.insert(
@@ -217,6 +237,7 @@ class AllegroProbeScene:
         self.dt = float(self.model.opt.timestep)
         self._viewer = None
         self._viewer_realtime = False
+        self._grip_alpha = 0.0
         self._index()
         self._initial_object_pos = np.zeros((self.n, 3), dtype=float)
         self.reset()
@@ -232,10 +253,13 @@ class AllegroProbeScene:
         return float(z)
 
     def _build_xml(self) -> str:
-        default_xml, asset_children, palm_xml, allegro_act, allegro_contact = _allegro_sections(
-            Path(self.config.menagerie_root),
-            visual_only=False,
-        )
+        if self.config.backend == "allegro":
+            default_xml, asset_children, palm_xml, hand_act, hand_contact = _allegro_sections(
+                Path(self.config.menagerie_root),
+                visual_only=False,
+            )
+        else:
+            default_xml = asset_children = palm_xml = hand_act = hand_contact = ""
 
         self._object_site_names.clear()
         self._free_joint_names.clear()
@@ -244,29 +268,18 @@ class AllegroProbeScene:
         sensors = []
         for obj in self.task.objects:
             x = self.candidate_x(obj.index)
-            pocket = max(obj.size[0], obj.size[1]) + 0.006
-            wall_t = 0.004
-            wall_h = 0.012
             if obj.family in {"mass", "fill"}:
                 support_top = self._object_center_z(obj) - obj.size[2]
                 if support_top > 0.010:
-                    support_half = max(0.010, min(obj.size[0], obj.size[1]) * 0.42)
+                    # A narrow pedestal supports reset while leaving the complete waist and
+                    # bottom rim accessible to a lateral grasp.  Enclosing cradle walls used
+                    # by the v0 scene obstructed the hand and are intentionally absent.
+                    support_half = max(0.008, min(obj.size[0], obj.size[1]) * 0.32)
                     nest_xml.append(
-                        f'<geom name="obj{obj.index}_raised_cradle" type="box" '
+                        f'<geom name="obj{obj.index}_pedestal" type="cylinder" '
                         f'pos="{x:.6g} 0 {support_top / 2.0:.6g}" '
-                        f'size="{support_half:.6g} {support_half:.6g} {support_top / 2.0:.6g}" '
+                        f'size="{support_half:.6g} {support_top / 2.0:.6g}" '
                         f'rgba="0.34 0.34 0.38 0.72" friction="1.4 0.04 0.002" condim="6"/>'
-                    )
-                for sx, sy, hx, hy in (
-                    (pocket + wall_t, 0.0, wall_t, pocket + wall_t),
-                    (-(pocket + wall_t), 0.0, wall_t, pocket + wall_t),
-                    (0.0, pocket + wall_t, pocket + wall_t, wall_t),
-                    (0.0, -(pocket + wall_t), pocket + wall_t, wall_t),
-                ):
-                    nest_xml.append(
-                        f'<geom type="box" pos="{x + sx:.6g} {sy:.6g} {support_top + wall_h / 2:.6g}" '
-                        f'size="{hx:.6g} {hy:.6g} {wall_h / 2:.6g}" '
-                        f'rgba="0.36 0.36 0.40 0.42" friction="0.6 0.02 0.001" condim="3"/>'
                     )
 
             body_xml, top_site, free_joint = self._object_xml(obj, x)
@@ -274,6 +287,7 @@ class AllegroProbeScene:
             self._free_joint_names.append(free_joint)
             object_xml.append(body_xml)
             sensors.append(f'<framepos name="obj{obj.index}_pos" objtype="site" objname="{top_site}"/>')
+            sensors.append(f'<framequat name="obj{obj.index}_quat" objtype="site" objname="{top_site}"/>')
 
         carriage, carriage_act, carriage_sensors = self._carriage_xml(palm_xml)
         asset_block = f"""
@@ -285,7 +299,7 @@ class AllegroProbeScene:
   </asset>
 """
         meshdir = Path(self.config.menagerie_root) / "assets"
-        contact_xml = self._contact_xml(allegro_contact, True)
+        contact_xml = self._contact_xml(hand_contact, self.config.backend == "allegro")
         return f"""
 <mujoco model="allegro_probe_scene">
   <compiler angle="radian" autolimits="true" meshdir="{meshdir}"/>
@@ -304,7 +318,7 @@ class AllegroProbeScene:
   </worldbody>
   <actuator>
     {carriage_act}
-    {allegro_act}
+    {hand_act}
   </actuator>
   <sensor>
     {carriage_sensors}
@@ -337,16 +351,16 @@ class AllegroProbeScene:
 <body name="obj{obj.index}" pos="{x:.6g} 0 0">
   <geom name="obj{obj.index}_base" type="box" pos="0 0 0.006"
         size="{sx:.6g} {sy:.6g} 0.006" rgba="{rgba}"
-        friction="1.2 0.02 0.001" condim="6"/>
-  <body name="obj{obj.index}_top" pos="0 0 {sz + 0.006:.6g}">
-    <joint name="obj{obj.index}_compress" type="slide" axis="0 0 -1"
-           range="0 0.012" stiffness="{obj.stiffness_N_per_m:.6g}"
+        contype="0" conaffinity="0"/>
+  <body name="obj{obj.index}_top" pos="0 0 {sz + 0.012:.6g}">
+    <joint name="obj{obj.index}_compress" type="slide" axis="0 0 1"
+           range="-0.012 0" stiffness="{obj.stiffness_N_per_m:.6g}"
            damping="{damping:.6g}" springref="0"/>
     <inertial pos="0 0 0" mass="{obj.mass_kg:.6g}"
               diaginertia="{_fmt(_inertia_box(obj.mass_kg, obj.size))}"/>
     <geom name="obj{obj.index}_geom" type="box" size="{sx:.6g} {sy:.6g} {sz:.6g}"
           rgba="{rgba}" friction="1.0 0.02 0.001" condim="6" priority="2"
-          solref="0.075 1" solimp="0.75 0.95 0.01"/>
+          solref="0.004 1" solimp="0.95 0.995 0.001"/>
     <site name="{top_site}" pos="0 0 {sz:.6g}" size="0.004"/>
   </body>
 </body>
@@ -413,28 +427,62 @@ class AllegroProbeScene:
     def _carriage_xml(self, palm_xml: str) -> Tuple[str, str, str]:
         cfg = self.config
         inert = '<inertial pos="0 0 0" mass="0.08" diaginertia="8e-5 8e-5 8e-5"/>'
+        probe_collision = (
+            'contype="1" conaffinity="1"'
+            if self.task.family in {"stiffness", "material"}
+            else 'contype="0" conaffinity="0"'
+        )
         body = [
             f'<body name="wrist_carriage" pos="0 0 {cfg.palm_height:.6g}">',
             '<joint name="wx" type="slide" axis="1 0 0" range="-0.55 0.55" damping="60" armature="0.1"/>',
             '<joint name="wy" type="slide" axis="0 1 0" range="-0.35 0.35" damping="60" armature="0.1"/>',
             '<joint name="wz" type="slide" axis="0 0 1" range="-0.55 0.14" damping="60" armature="0.1"/>',
+            '<joint name="wr" type="hinge" axis="1 0 0" range="-0.9 0.9" damping="6" armature="0.05"/>',
             '<joint name="wt" type="hinge" axis="0 1 0" range="-0.9 0.9" damping="6" armature="0.05"/>',
             '<joint name="wyaw" type="hinge" axis="0 0 1" range="-1.2 1.2" damping="4" armature="0.03"/>',
             inert,
             '<body name="wrist_ft_body">',
             '<site name="wrist_ft_site" pos="0 0 0" size="0.006" rgba="0.2 0.9 0.2 0.3"/>',
-            palm_xml,
+            '<site name="wrist_pose_site" pos="0 0 0" size="0.003" rgba="0 0 0 0"/>',
+            palm_xml if cfg.backend == "allegro" else "",
             '<body name="probe_mount" pos="0 0 0">',
             '<joint name="wp" type="slide" axis="0 0 -1" range="0 0.18" damping="8" armature="0.02"/>',
             inert,
             '<body name="probe_force_body">',
             '<site name="probe_force_site" pos="0 0 0" size="0.004"/>',
             '<geom name="probe_tip_geom" type="capsule" fromto="0 0 0.060 0 0 0" size="0.005" '
-            'rgba="0.9 0.15 0.10 1" friction="1.4 0.02 0.001" condim="6"/>',
+            f'rgba="0.9 0.15 0.10 1" friction="1.4 0.02 0.001" condim="6" {probe_collision}/>',
             '<site name="probe_tip_site" pos="0 0 0" size="0.007" rgba="0.9 0.15 0.10 0.25"/>',
             '</body>',
             '</body>',
         ]
+
+        if cfg.backend == "reference":
+            jaw_collision = (
+                'contype="1" conaffinity="1"'
+                if self.task.family in {"mass", "fill"}
+                else 'contype="0" conaffinity="0"'
+            )
+            body.extend([
+                '<body name="ref_left_jaw" pos="0 -0.060 0">',
+                '<joint name="ref_left_close" type="slide" axis="0 1 0" range="0 0.040" damping="4"/>',
+                '<geom name="ref_left_jaw_geom" type="box" pos="0 0 0" size="0.012 0.008 0.028" '
+                f'friction="4.0 0.04 0.003" condim="6" rgba="0.2 0.55 0.9 1" {jaw_collision}/>',
+                '<geom name="ref_left_hook_geom" type="box" pos="0 0.010 -0.039" '
+                f'size="0.012 0.006 0.003" friction="2.0 0.03 0.002" condim="6" '
+                f'rgba="0.15 0.45 0.8 1" {jaw_collision}/>',
+                '<site name="ref_left_touch_site" pos="0 0.008 0" size="0.014 0.010 0.030" type="box"/>',
+                '</body>',
+                '<body name="ref_right_jaw" pos="0 0.060 0">',
+                '<joint name="ref_right_close" type="slide" axis="0 -1 0" range="0 0.040" damping="4"/>',
+                '<geom name="ref_right_jaw_geom" type="box" pos="0 0 0" size="0.012 0.008 0.028" '
+                f'friction="4.0 0.04 0.003" condim="6" rgba="0.2 0.55 0.9 1" {jaw_collision}/>',
+                '<geom name="ref_right_hook_geom" type="box" pos="0 -0.010 -0.039" '
+                f'size="0.012 0.006 0.003" friction="2.0 0.03 0.002" condim="6" '
+                f'rgba="0.15 0.45 0.8 1" {jaw_collision}/>',
+                '<site name="ref_right_touch_site" pos="0 -0.008 0" size="0.014 0.010 0.030" type="box"/>',
+                '</body>',
+            ])
 
         body.extend(["</body>", "</body>"])
 
@@ -442,25 +490,47 @@ class AllegroProbeScene:
             '<position name="act_wx" joint="wx" kp="650" ctrlrange="-0.55 0.55"/>',
             '<position name="act_wy" joint="wy" kp="650" ctrlrange="-0.35 0.35"/>',
             '<position name="act_wz" joint="wz" kp="900" ctrlrange="-0.55 0.14"/>',
+            '<position name="act_wr" joint="wr" kp="120" ctrlrange="-0.9 0.9"/>',
             '<position name="act_wt" joint="wt" kp="120" ctrlrange="-0.9 0.9"/>',
             '<position name="act_wyaw" joint="wyaw" kp="80" ctrlrange="-1.2 1.2"/>',
             '<position name="act_wp" joint="wp" kp="180" ctrlrange="0 0.18"/>',
         ]
+        if cfg.backend == "reference":
+            act.extend([
+                '<position name="act_ref_left" joint="ref_left_close" kp="220" '
+                'ctrlrange="0 0.040" forcerange="-45 45"/>',
+                '<position name="act_ref_right" joint="ref_right_close" kp="220" '
+                'ctrlrange="0 0.040" forcerange="-45 45"/>',
+            ])
         sensors = [
             '<touch name="probe_touch" site="probe_tip_site"/>',
             '<force name="probe_force" site="probe_force_site"/>',
             '<framepos name="probe_framepos" objtype="site" objname="probe_tip_site"/>',
             '<force name="wrist_force" site="wrist_ft_site"/>',
             '<torque name="wrist_torque" site="wrist_ft_site"/>',
+            '<framepos name="wrist_framepos" objtype="site" objname="wrist_pose_site"/>',
+            '<framequat name="wrist_framequat" objtype="site" objname="wrist_pose_site"/>',
         ]
-        for j in ("wx", "wy", "wz", "wt", "wyaw", "wp"):
+        for j in ("wx", "wy", "wz", "wr", "wt", "wyaw", "wp"):
             sensors.append(f'<jointpos name="{j}_pos" joint="{j}"/>')
             sensors.append(f'<jointvel name="{j}_vel" joint="{j}"/>')
-        for prefix in ("ff", "mf", "rf", "th"):
-            sensors.append(f'<touch name="{prefix}_tip_touch" site="{prefix}_tip_site"/>')
-            sensors.append(f'<framepos name="{prefix}_tip_pos" objtype="site" objname="{prefix}_tip_site"/>')
-        for aname in ALLEGRO_ACTUATORS:
-            sensors.append(f'<actuatorfrc name="{aname}_frc" actuator="{aname}"/>')
+        if cfg.backend == "allegro":
+            for prefix in ("ff", "mf", "rf", "th"):
+                sensors.append(f'<touch name="{prefix}_tip_touch" site="{prefix}_tip_site"/>')
+                sensors.append(f'<framepos name="{prefix}_tip_pos" objtype="site" objname="{prefix}_tip_site"/>')
+            for aname in ALLEGRO_ACTUATORS:
+                sensors.append(f'<actuatorfrc name="{aname}_frc" actuator="{aname}"/>')
+                joint = aname.replace("a", "j")
+                sensors.append(
+                    f'<jointactuatorfrc name="{joint}_actuatorfrc" joint="{joint}"/>'
+                )
+        else:
+            sensors.extend([
+                '<touch name="ref_left_touch" site="ref_left_touch_site"/>',
+                '<touch name="ref_right_touch" site="ref_right_touch_site"/>',
+                '<jointactuatorfrc name="ref_left_actuatorfrc" joint="ref_left_close"/>',
+                '<jointactuatorfrc name="ref_right_actuatorfrc" joint="ref_right_close"/>',
+            ])
         return "".join(body), "".join(act), "".join(sensors)
 
     # ------------------------------------------------------------------ indexing/reset
@@ -471,10 +541,15 @@ class AllegroProbeScene:
             name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_SENSOR, sid)
             self.sensor_index[name] = (int(self.model.sensor_adr[sid]), int(self.model.sensor_dim[sid]))
         self.geom: Dict[str, int] = {}
+        self.geom_body_name: Dict[int, str] = {}
         for gid in range(self.model.ngeom):
             name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, gid)
             if name:
                 self.geom[name] = gid
+            bid = int(self.model.geom_bodyid[gid])
+            self.geom_body_name[gid] = (
+                mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_BODY, bid) or ""
+            )
         probe_gid = self.geom.get("probe_tip_geom")
         if probe_gid is not None:
             self._probe_contype = int(self.model.geom_contype[probe_gid])
@@ -498,7 +573,6 @@ class AllegroProbeScene:
     def reset(self) -> None:
         mj = self.mujoco
         mj.mj_resetData(self.model, self.data)
-        self.set_probe_collision(True)
         for i, free_joint in enumerate(self._free_joint_names):
             if not free_joint:
                 continue
@@ -507,25 +581,39 @@ class AllegroProbeScene:
             self.data.qpos[qadr:qadr + 3] = [self.candidate_x(i), 0.0, self._object_center_z(obj)]
             self.data.qpos[qadr + 3:qadr + 7] = [1.0, 0.0, 0.0, 0.0]
 
-        self.command(x=0.0, y=0.0, z=0.10, tilt=0.0, yaw=0.0, probe=0.0, grip=0.0)
-        self._set_allegro_neutral()
+        self.command(
+            x=0.0,
+            y=0.0,
+            z=0.10,
+            roll=0.0,
+            tilt=0.0,
+            yaw=0.0,
+            probe=0.0,
+            grip=0.0,
+        )
+        self._set_hand_neutral()
         mj.mj_forward(self.model, self.data)
         self.step(150)
         self._initial_object_pos = np.array([self.object_pos(i) for i in range(self.n)])
 
-    def _set_allegro_neutral(self) -> None:
-        self.command_allegro_grip(0.0)
+    def _set_hand_neutral(self) -> None:
+        self.command_grip(0.0)
 
     def set_probe_collision(self, enabled: bool) -> None:
+        """Compatibility shim.
+
+        Probe collision is fixed when the model is compiled: enabled for poke/slide
+        scenes and disabled for heft/shake scenes.  Runtime collision spoofing is
+        deliberately rejected.
+        """
         gid = self.geom.get("probe_tip_geom")
         if gid is None:
             return
-        if enabled:
-            self.model.geom_contype[gid] = self._probe_contype
-            self.model.geom_conaffinity[gid] = self._probe_conaffinity
-        else:
-            self.model.geom_contype[gid] = 0
-            self.model.geom_conaffinity[gid] = 0
+        expected = self.task.family in {"stiffness", "material"}
+        if bool(enabled) != expected:
+            raise RuntimeError(
+                "probe collision is fixed per scene; construct the matching family/backend"
+            )
 
     def attach_viewer(self, viewer, realtime: bool = True) -> None:
         self._viewer = viewer
@@ -542,6 +630,7 @@ class AllegroProbeScene:
         x: Optional[float] = None,
         y: Optional[float] = None,
         z: Optional[float] = None,
+        roll: Optional[float] = None,
         tilt: Optional[float] = None,
         yaw: Optional[float] = None,
         probe: Optional[float] = None,
@@ -553,6 +642,8 @@ class AllegroProbeScene:
             self.data.ctrl[self.act["act_wy"]] = float(y)
         if z is not None:
             self.data.ctrl[self.act["act_wz"]] = float(z)
+        if roll is not None:
+            self.data.ctrl[self.act["act_wr"]] = float(roll)
         if tilt is not None:
             self.data.ctrl[self.act["act_wt"]] = float(tilt)
         if yaw is not None:
@@ -560,8 +651,17 @@ class AllegroProbeScene:
         if probe is not None:
             self.data.ctrl[self.act["act_wp"]] = float(probe)
         if grip is not None:
-            alpha = float(np.clip(grip / 0.064, 0.0, 1.0))
-            self.command_allegro_grip(alpha)
+            self.command_grip(float(np.clip(grip, 0.0, 1.0)))
+
+    def command_grip(self, alpha: float) -> None:
+        a = float(np.clip(alpha, 0.0, 1.0))
+        self._grip_alpha = a
+        if self.config.backend == "allegro":
+            self.command_allegro_grip(a)
+            return
+        target = 0.032 * a
+        self.data.ctrl[self.act["act_ref_left"]] = target
+        self.data.ctrl[self.act["act_ref_right"]] = target
 
     def command_allegro_grip(self, alpha: float) -> None:
         if "ffa0" not in self.act:
@@ -600,6 +700,9 @@ class AllegroProbeScene:
     def object_pos(self, i: int) -> np.ndarray:
         return self.sensor(f"obj{i}_pos")
 
+    def object_quat(self, i: int) -> np.ndarray:
+        return self.sensor(f"obj{i}_quat")
+
     def object_displacement(self, i: int) -> float:
         return float(np.linalg.norm(self.object_pos(i) - self._initial_object_pos[i]))
 
@@ -627,7 +730,17 @@ class AllegroProbeScene:
     def wrist_torque_vec(self) -> np.ndarray:
         return self.sensor("wrist_torque")
 
+    def wrist_pos(self) -> np.ndarray:
+        return self.sensor("wrist_framepos")
+
+    def wrist_quat(self) -> np.ndarray:
+        return self.sensor("wrist_framequat")
+
     def finger_touch_total(self) -> float:
+        if self.config.backend == "reference":
+            return float(
+                self.sensor("ref_left_touch")[0] + self.sensor("ref_right_touch")[0]
+            )
         return float(
             sum(
                 float(self.sensor(f"{prefix}_tip_touch")[0])
@@ -636,6 +749,8 @@ class AllegroProbeScene:
         )
 
     def fingertip_positions(self) -> Dict[str, np.ndarray]:
+        if self.config.backend == "reference":
+            return {}
         return {
             prefix: self.sensor(f"{prefix}_tip_pos")
             for prefix in ("ff", "mf", "rf", "th")
@@ -643,3 +758,97 @@ class AllegroProbeScene:
 
     def wz_for_tip_z(self, z_world: float, probe_extension: float = 0.0) -> float:
         return float(np.clip(z_world - self.config.palm_height + probe_extension, -0.55, 0.14))
+
+    def relative_object_position(self, i: int) -> np.ndarray:
+        return self.object_pos(i) - self.wrist_pos()
+
+    def contact_snapshot(self, i: int) -> ContactSnapshot:
+        """Summarize actual MuJoCo contacts involving one object.
+
+        Contacts are classified by geom/body identity rather than touch-site coverage,
+        because an Allegro wrap grasp may use medial and distal links legitimately.
+        """
+
+        object_prefix = f"obj{i}_"
+        support_name = f"obj{i}_pedestal"
+        hand_groups: Set[str] = set()
+        hand_count = 0
+        hand_force = 0.0
+        support_contact = False
+        support_force = 0.0
+        table_contact = False
+        max_penetration = 0.0
+
+        def geom_name(gid: int) -> str:
+            return (
+                self.mujoco.mj_id2name(
+                    self.model, self.mujoco.mjtObj.mjOBJ_GEOM, int(gid)
+                )
+                or ""
+            )
+
+        def is_object_geom(name: str) -> bool:
+            return (
+                name.startswith(object_prefix)
+                and name != support_name
+                and "pedestal" not in name
+            )
+
+        for ci in range(int(self.data.ncon)):
+            contact = self.data.contact[ci]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            n1, n2 = geom_name(g1), geom_name(g2)
+            if is_object_geom(n1):
+                other_gid, other_name = g2, n2
+            elif is_object_geom(n2):
+                other_gid, other_name = g1, n1
+            else:
+                continue
+
+            wrench = np.zeros(6, dtype=float)
+            self.mujoco.mj_contactForce(self.model, self.data, ci, wrench)
+            normal_force = max(float(wrench[0]), 0.0)
+            max_penetration = max(max_penetration, max(-float(contact.dist), 0.0))
+
+            if other_name == support_name:
+                support_contact = support_contact or normal_force > 1e-4
+                support_force += normal_force
+                continue
+            if other_name in {"table", "floor"}:
+                table_contact = table_contact or normal_force > 1e-4
+                continue
+
+            body_name = self.geom_body_name.get(other_gid, "")
+            group = self._hand_contact_group(body_name, other_name)
+            if group is not None:
+                hand_groups.add(group)
+                hand_count += 1
+                hand_force += normal_force
+
+        return ContactSnapshot(
+            hand_groups=tuple(sorted(hand_groups)),
+            hand_contact_count=hand_count,
+            hand_normal_force_N=hand_force,
+            support_contact=support_contact,
+            support_normal_force_N=support_force,
+            table_contact=table_contact,
+            max_penetration_m=max_penetration,
+        )
+
+    def _hand_contact_group(self, body_name: str, geom_name: str) -> Optional[str]:
+        if self.config.backend == "reference":
+            if body_name == "ref_left_jaw" or geom_name.startswith("ref_left"):
+                return "left"
+            if body_name == "ref_right_jaw" or geom_name.startswith("ref_right"):
+                return "right"
+            return None
+        for prefix in ("ff", "mf", "rf", "th"):
+            if body_name.startswith(prefix) or geom_name.startswith(prefix):
+                return prefix
+        return None
+
+    def has_opposing_grasp(self, snapshot: ContactSnapshot) -> bool:
+        groups = set(snapshot.hand_groups)
+        if self.config.backend == "reference":
+            return {"left", "right"}.issubset(groups)
+        return "th" in groups and bool(groups.intersection({"ff", "mf", "rf"}))

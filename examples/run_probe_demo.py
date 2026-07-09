@@ -9,9 +9,11 @@ from pathlib import Path
 import time
 
 from allegro_probe import (
+    AllegroHandBackend,
     AllegroProbeScene,
     ProbeCommand,
     ProbeHarness,
+    ReferenceProbeBackend,
     SceneConfig,
     make_demo_scene,
     primitive_for_family,
@@ -20,7 +22,7 @@ from allegro_probe.models import canonical_family
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Allegro probe primitive demo")
+    parser = argparse.ArgumentParser(description="MuJoCo probe primitive demo")
     parser.add_argument(
         "--family",
         default="mass",
@@ -30,11 +32,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--primitive", default=None)
     parser.add_argument(
+        "--backend",
+        choices=["reference", "allegro"],
+        default="allegro",
+    )
+    parser.add_argument(
         "--menagerie-root",
         type=Path,
         default=Path("/home/enovo/robots/sim/mujoco_menagerie/wonik_allegro"),
     )
     parser.add_argument("--reset-between-probes", action="store_true")
+    parser.add_argument("--include-trace", action="store_true")
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--hold-open", action="store_true")
     args = parser.parse_args()
@@ -44,9 +52,11 @@ def main() -> None:
     spec = make_demo_scene(family, args.candidates, args.seed)
     scene = AllegroProbeScene(
         spec,
-        SceneConfig(menagerie_root=args.menagerie_root),
+        SceneConfig(menagerie_root=args.menagerie_root, backend=args.backend),
     )
-    harness = ProbeHarness(scene)
+    backend_cls = ReferenceProbeBackend if args.backend == "reference" else AllegroHandBackend
+    backend = backend_cls(scene)
+    harness = ProbeHarness(backend)
 
     viewer_context = nullcontext(None)
     if args.viewer:
@@ -67,7 +77,7 @@ def main() -> None:
             if args.reset_between_probes and target > 0:
                 scene.reset()
             result = harness.execute(ProbeCommand(primitive=primitive, target=target))
-            print(json.dumps(result.to_dict(), indent=2))
+            print(json.dumps(result.to_dict(include_trace=args.include_trace), indent=2))
 
         if viewer is not None and args.hold_open:
             print("\nClose the viewer or press Ctrl-C to exit.")
