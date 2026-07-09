@@ -101,3 +101,19 @@ tests/
 通用 IK、运动规划或鲁棒抓取系统。换物体尺寸、位置和随机种子后需要重新验证。
 当前 feature 也没有做跨场景物理标定，例如 `m_est_kg` 会混入手部和腕部
 动力学影响，应先视为用于同场景比较的质量代理，而不是可靠的绝对测量值。
+
+
+当前配置：
+任务	主要碰撞体	读取信号
+stiffness / poke	中央 probe_tip_geom 与物体	probe_touch、probe_force
+material / slide	中央 probe_tip_geom 与物体	法向 touch、探针三轴 force
+mass / heft	Allegro 中段、远端、指尖碰撞体	腕部 force、指尖 touch、物体位姿
+fill / shake	Allegro 中段、远端、指尖碰撞体	腕部 force/torque、指尖 touch、物体位姿
+
+另外：
+手掌、基座和近端指节碰撞被关闭，但视觉 mesh 仍显示。
+poke/slide 时 Allegro 的有效碰撞体没有关闭，只是主要接触由中央探针完成。
+heft/shake 时会关闭中央探针碰撞，避免它干扰抓取。
+隐藏液体球的碰撞关闭，液体效果仅通过内部滑动关节和惯性模拟。
+桌面、托架和物体几何体也都参与碰撞。
+所以目前不是“每个任务只启用指定传感器”，而是按任务切换主要执行碰撞体，但场景中仍有其他碰撞体存在。
