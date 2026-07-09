@@ -104,11 +104,13 @@ tests/
 
 
 当前配置：
-任务	主要碰撞体	读取信号
-stiffness / poke	中央 probe_tip_geom 与物体	probe_touch、probe_force
-material / slide	中央 probe_tip_geom 与物体	法向 touch、探针三轴 force
-mass / heft	Allegro 中段、远端、指尖碰撞体	腕部 force、指尖 touch、物体位姿
-fill / shake	Allegro 中段、远端、指尖碰撞体	腕部 force/torque、指尖 touch、物体位姿
+| 任务 | 主要碰撞体 | 读取信号 |
+|---|---|---|
+| stiffness / poke | 中央 `probe_tip_geom` 与物体 | `probe_touch`、`probe_force` |
+| material / slide | 中央 `probe_tip_geom` 与物体 | 法向 touch、探针三轴 force |
+| mass / heft | Allegro 中段、远端、指尖碰撞体 | 腕部 force、指尖 touch、物体位姿 |
+| fill / shake | Allegro 中段、远端、指尖碰撞体 | 腕部 force/torque、指尖 touch、物体位姿 |
+
 
 另外：
 手掌、基座和近端指节碰撞被关闭，但视觉 mesh 仍显示。
