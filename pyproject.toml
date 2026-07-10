@@ -18,6 +18,8 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 allegro-probe-demo = "examples.run_probe_demo:main"
+allegro-short-can-pick-place = "examples.run_short_can_pick_place:main"
+allegro-pose-pick-place = "examples.run_pose_conditioned_pick_place:main"
 
 [tool.setuptools.packages.find]
 include = ["allegro_probe*", "examples*"]

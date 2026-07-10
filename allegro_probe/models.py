@@ -106,6 +106,8 @@ class ProbeResult:
     params: Dict[str, Any] = field(default_factory=dict)
     raw_summary: Dict[str, Any] = field(default_factory=dict)
     trace: Dict[str, Any] = field(default_factory=dict)
+    # Appended to preserve the positional ABI of all pre-v2 ProbeResult fields.
+    scene_id: str = ""
 
     def to_dict(self, include_trace: bool = False) -> Dict[str, Any]:
         def convert(value: Any) -> Any:

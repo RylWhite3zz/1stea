@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
+from allegro_probe.geometry import quaternion_wxyz_to_matrix
 from allegro_probe.models import BACKENDS, ObjectSpec, ProbeSceneSpec
 
 
@@ -41,7 +42,7 @@ _ALLEGRO_CYLINDER_CLOSED = np.array([
 ], dtype=float)
 
 
-@dataclass
+@dataclass(frozen=True)
 class SceneConfig:
     menagerie_root: Path = DEFAULT_MENAGERIE_ROOT
     backend: str = "allegro"
@@ -49,10 +50,23 @@ class SceneConfig:
     palm_height: float = 0.34
     timestep: float = 0.002
     allegro_grasp_lift: float = 0.090
+    short_can_place_y: float = 0.120
+    full_hand_collisions: bool = False
+    wrist_roll_limit_rad: float = 0.9
+    wrist_tilt_limit_rad: float = 0.9
+    wrist_yaw_limit_rad: float = 1.2
 
     def __post_init__(self) -> None:
         if self.backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}, got {self.backend!r}")
+        for name in (
+            "wrist_roll_limit_rad",
+            "wrist_tilt_limit_rad",
+            "wrist_yaw_limit_rad",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0.0 or value > np.pi:
+                raise ValueError(f"{name} must be finite and in (0, pi], got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -60,12 +74,33 @@ class ContactSnapshot:
     """Contact facts used by primitive validity gates."""
 
     hand_groups: Tuple[str, ...] = ()
+    hand_force_by_group_N: Tuple[Tuple[str, float], ...] = ()
+    hand_object_geoms: Tuple[str, ...] = ()
+    hand_contact_geoms: Tuple[str, ...] = ()
+    hand_contact_bodies: Tuple[str, ...] = ()
     hand_contact_count: int = 0
     hand_normal_force_N: float = 0.0
+    palm_object_contact: bool = False
+    palm_object_normal_force_N: float = 0.0
     support_contact: bool = False
     support_normal_force_N: float = 0.0
     table_contact: bool = False
+    table_normal_force_N: float = 0.0
+    hand_table_contact: bool = False
+    hand_table_normal_force_N: float = 0.0
+    hand_support_contact: bool = False
+    hand_support_normal_force_N: float = 0.0
+    palm_table_contact: bool = False
+    palm_support_contact: bool = False
+    hand_other_object_contact: bool = False
+    hand_other_object_normal_force_N: float = 0.0
+    hand_other_object_geoms: Tuple[str, ...] = ()
+    object_other_object_contact: bool = False
+    object_other_object_normal_force_N: float = 0.0
     max_penetration_m: float = 0.0
+    hand_max_penetration_m: float = 0.0
+    support_max_penetration_m: float = 0.0
+    table_max_penetration_m: float = 0.0
 
 
 def _fmt(vals) -> str:
@@ -88,7 +123,11 @@ def _inertia_cylinder(mass_kg: float, radius: float, half_height: float) -> Tupl
     return ix, ix, iz
 
 
-def _allegro_sections(root: Path, visual_only: bool = True) -> Tuple[str, str, str, str, str]:
+def _allegro_sections(
+    root: Path,
+    visual_only: bool = True,
+    full_hand_collisions: bool = False,
+) -> Tuple[str, str, str, str, str]:
     """Return default XML, asset children, palm body, actuator children, contact excludes."""
 
     hand_xml = root / "right_hand.xml"
@@ -146,7 +185,7 @@ def _allegro_sections(root: Path, visual_only: bool = True) -> Tuple[str, str, s
                         geom.set("friction", "3.5 0.06 0.004")
                         geom.set("condim", "6")
                         geom.set("priority", "3")
-                    else:
+                    elif not full_hand_collisions:
                         geom.set("contype", "0")
                         geom.set("conaffinity", "0")
                         geom.set("mass", "0")
@@ -257,6 +296,7 @@ class AllegroProbeScene:
             default_xml, asset_children, palm_xml, hand_act, hand_contact = _allegro_sections(
                 Path(self.config.menagerie_root),
                 visual_only=False,
+                full_hand_collisions=self.config.full_hand_collisions,
             )
         else:
             default_xml = asset_children = palm_xml = hand_act = hand_contact = ""
@@ -437,9 +477,9 @@ class AllegroProbeScene:
             '<joint name="wx" type="slide" axis="1 0 0" range="-0.55 0.55" damping="60" armature="0.1"/>',
             '<joint name="wy" type="slide" axis="0 1 0" range="-0.35 0.35" damping="60" armature="0.1"/>',
             '<joint name="wz" type="slide" axis="0 0 1" range="-0.55 0.14" damping="60" armature="0.1"/>',
-            '<joint name="wr" type="hinge" axis="1 0 0" range="-0.9 0.9" damping="6" armature="0.05"/>',
-            '<joint name="wt" type="hinge" axis="0 1 0" range="-0.9 0.9" damping="6" armature="0.05"/>',
-            '<joint name="wyaw" type="hinge" axis="0 0 1" range="-1.2 1.2" damping="4" armature="0.03"/>',
+            f'<joint name="wr" type="hinge" axis="1 0 0" range="{-cfg.wrist_roll_limit_rad:.12g} {cfg.wrist_roll_limit_rad:.12g}" damping="6" armature="0.05"/>',
+            f'<joint name="wt" type="hinge" axis="0 1 0" range="{-cfg.wrist_tilt_limit_rad:.12g} {cfg.wrist_tilt_limit_rad:.12g}" damping="6" armature="0.05"/>',
+            f'<joint name="wyaw" type="hinge" axis="0 0 1" range="{-cfg.wrist_yaw_limit_rad:.12g} {cfg.wrist_yaw_limit_rad:.12g}" damping="4" armature="0.03"/>',
             inert,
             '<body name="wrist_ft_body">',
             '<site name="wrist_ft_site" pos="0 0 0" size="0.006" rgba="0.2 0.9 0.2 0.3"/>',
@@ -490,9 +530,9 @@ class AllegroProbeScene:
             '<position name="act_wx" joint="wx" kp="650" ctrlrange="-0.55 0.55"/>',
             '<position name="act_wy" joint="wy" kp="650" ctrlrange="-0.35 0.35"/>',
             '<position name="act_wz" joint="wz" kp="900" ctrlrange="-0.55 0.14"/>',
-            '<position name="act_wr" joint="wr" kp="120" ctrlrange="-0.9 0.9"/>',
-            '<position name="act_wt" joint="wt" kp="120" ctrlrange="-0.9 0.9"/>',
-            '<position name="act_wyaw" joint="wyaw" kp="80" ctrlrange="-1.2 1.2"/>',
+            f'<position name="act_wr" joint="wr" kp="120" ctrlrange="{-cfg.wrist_roll_limit_rad:.12g} {cfg.wrist_roll_limit_rad:.12g}"/>',
+            f'<position name="act_wt" joint="wt" kp="120" ctrlrange="{-cfg.wrist_tilt_limit_rad:.12g} {cfg.wrist_tilt_limit_rad:.12g}"/>',
+            f'<position name="act_wyaw" joint="wyaw" kp="80" ctrlrange="{-cfg.wrist_yaw_limit_rad:.12g} {cfg.wrist_yaw_limit_rad:.12g}"/>',
             '<position name="act_wp" joint="wp" kp="180" ctrlrange="0 0.18"/>',
         ]
         if cfg.backend == "reference":
@@ -569,6 +609,33 @@ class AllegroProbeScene:
     @property
     def sensor_names(self) -> List[str]:
         return sorted(self.sensor_index)
+
+    def full_hand_collisions_compiled(self) -> bool:
+        """Return whether every palm/base/proximal collision proxy is active."""
+
+        if self.config.backend != "allegro":
+            return False
+        required = (
+            "palm_palm_collision",
+            "ff_base_base_collision",
+            "ff_proximal_proximal_collision",
+            "mf_base_base_collision",
+            "mf_proximal_proximal_collision",
+            "rf_base_base_collision",
+            "rf_proximal_proximal_collision",
+            "th_base_thumb_base_collision",
+            "th_proximal_thumb_proximal_collision",
+        )
+        for name in required:
+            gid = self.geom.get(name)
+            if gid is None:
+                return False
+            if (
+                int(self.model.geom_contype[gid]) == 0
+                or int(self.model.geom_conaffinity[gid]) == 0
+            ):
+                return False
+        return True
 
     def reset(self) -> None:
         mj = self.mujoco
@@ -666,8 +733,31 @@ class AllegroProbeScene:
     def command_allegro_grip(self, alpha: float) -> None:
         if "ffa0" not in self.act:
             return
+        self.command_allegro_joints(self.allegro_grip_pose(alpha))
+
+    @staticmethod
+    def allegro_grip_pose(alpha: float) -> np.ndarray:
+        """Return the legacy cylinder-synergy pose at one closure progress."""
+
         a = float(np.clip(alpha, 0.0, 1.0))
-        pose = (1.0 - a) * _ALLEGRO_OPEN + a * _ALLEGRO_CYLINDER_CLOSED
+        return (1.0 - a) * _ALLEGRO_OPEN + a * _ALLEGRO_CYLINDER_CLOSED
+
+    def command_allegro_joints(self, targets: np.ndarray) -> None:
+        """Command all 16 Allegro position actuators explicitly.
+
+        The public manipulation path uses object-specific 16-DoF hand templates.
+        ``command_grip`` remains as the one-dimensional compatibility path used by
+        the probe primitives.
+        """
+
+        if self.config.backend != "allegro":
+            raise RuntimeError("16-DoF Allegro commands require backend='allegro'")
+        pose = np.asarray(targets, dtype=float)
+        if pose.shape != (len(ALLEGRO_ACTUATORS),):
+            raise ValueError(
+                f"expected {len(ALLEGRO_ACTUATORS)} Allegro joint targets, "
+                f"got shape {pose.shape}"
+            )
         for idx, name in enumerate(ALLEGRO_ACTUATORS):
             aid = self.act.get(name)
             if aid is None:
@@ -677,6 +767,38 @@ class AllegroProbeScene:
                 lo, hi = self.model.actuator_ctrlrange[aid]
                 val = float(np.clip(val, lo, hi))
             self.data.ctrl[aid] = val
+
+    def allegro_joint_targets(self) -> np.ndarray:
+        if self.config.backend != "allegro":
+            return np.zeros(0, dtype=float)
+        return np.asarray(
+            [self.data.ctrl[self.act[name]] for name in ALLEGRO_ACTUATORS],
+            dtype=float,
+        )
+
+    def allegro_joint_positions(self) -> np.ndarray:
+        if self.config.backend != "allegro":
+            return np.zeros(0, dtype=float)
+        return np.asarray(
+            [
+                self.data.qpos[self.joint_qadr[name.replace("a", "j")]]
+                for name in ALLEGRO_ACTUATORS
+            ],
+            dtype=float,
+        )
+
+    def set_allegro_position_kp(self, kp: float) -> None:
+        """Set the simulated Allegro position-servo stiffness for guarded phases."""
+
+        if self.config.backend != "allegro":
+            raise RuntimeError("Allegro gain scheduling requires backend='allegro'")
+        value = float(kp)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Allegro kp must be positive and finite, got {kp!r}")
+        for name in ALLEGRO_ACTUATORS:
+            aid = self.act[name]
+            self.model.actuator_gainprm[aid, 0] = value
+            self.model.actuator_biasprm[aid, 1] = -value
 
     def step(self, n: int = 1) -> None:
         for _ in range(int(n)):
@@ -702,6 +824,59 @@ class AllegroProbeScene:
 
     def object_quat(self, i: int) -> np.ndarray:
         return self.sensor(f"obj{i}_quat")
+
+    def object_center_pos(self, i: int) -> np.ndarray:
+        """Return the geometry-center position, including for tilted objects.
+
+        ``object_pos`` is retained for compatibility and returns the top-site
+        position.  New pose-conditioned manipulation must use this method.
+        """
+
+        local_top = np.asarray([0.0, 0.0, self.task.objects[i].size[2]], dtype=float)
+        world_top_offset = quaternion_wxyz_to_matrix(self.object_quat(i)) @ local_top
+        return self.object_pos(i) - world_top_offset
+
+    def set_object_pose(
+        self,
+        i: int,
+        *,
+        center_position_m: Tuple[float, float, float],
+        quaternion_wxyz: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+        zero_velocity: bool = True,
+        record_initial: bool = False,
+    ) -> None:
+        """Place one free object at an explicit geometry-center world pose."""
+
+        index = int(i)
+        if index < 0 or index >= self.n:
+            raise IndexError(f"object index {index} outside [0, {self.n})")
+        free_joint = self._free_joint_names[index]
+        if not free_joint:
+            raise ValueError(f"object {index} does not have a free joint")
+        position = np.asarray(center_position_m, dtype=float)
+        quaternion = np.asarray(quaternion_wxyz, dtype=float)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError("center_position_m must be a finite 3-vector")
+        if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
+            raise ValueError("quaternion_wxyz must be a finite 4-vector")
+        norm = float(np.linalg.norm(quaternion))
+        if norm <= 1e-12:
+            raise ValueError("quaternion_wxyz must have non-zero norm")
+        quaternion /= norm
+
+        qadr = self.joint_qadr[free_joint]
+        self.data.qpos[qadr:qadr + 3] = position
+        self.data.qpos[qadr + 3:qadr + 7] = quaternion
+        if zero_velocity:
+            jid = self.mujoco.mj_name2id(
+                self.model, self.mujoco.mjtObj.mjOBJ_JOINT, free_joint
+            )
+            dadr = int(self.model.jnt_dofadr[jid])
+            self.data.qvel[dadr:dadr + 6] = 0.0
+
+        self.mujoco.mj_forward(self.model, self.data)
+        if record_initial:
+            self._initial_object_pos[index] = self.object_pos(index)
 
     def object_displacement(self, i: int) -> float:
         return float(np.linalg.norm(self.object_pos(i) - self._initial_object_pos[i]))
@@ -772,12 +947,33 @@ class AllegroProbeScene:
         object_prefix = f"obj{i}_"
         support_name = f"obj{i}_pedestal"
         hand_groups: Set[str] = set()
+        hand_force_by_group: Dict[str, float] = {}
+        hand_object_geoms: Set[str] = set()
+        hand_contact_geoms: Set[str] = set()
+        hand_contact_bodies: Set[str] = set()
         hand_count = 0
         hand_force = 0.0
+        palm_object_contact = False
+        palm_object_force = 0.0
         support_contact = False
         support_force = 0.0
         table_contact = False
+        table_force = 0.0
+        hand_table_contact = False
+        hand_table_force = 0.0
+        hand_support_contact = False
+        hand_support_force = 0.0
+        palm_table_contact = False
+        palm_support_contact = False
+        hand_other_object_contact = False
+        hand_other_object_force = 0.0
+        hand_other_object_geoms: Set[str] = set()
+        object_other_object_contact = False
+        object_other_object_force = 0.0
         max_penetration = 0.0
+        hand_max_penetration = 0.0
+        support_max_penetration = 0.0
+        table_max_penetration = 0.0
 
         def geom_name(gid: int) -> str:
             return (
@@ -794,10 +990,81 @@ class AllegroProbeScene:
                 and "pedestal" not in name
             )
 
+        def is_any_object_geom(name: str) -> bool:
+            return (
+                name.startswith("obj")
+                and "pedestal" not in name
+                and "hidden_liquid" not in name
+            )
+
+        def is_palm(body_name: str, name: str) -> bool:
+            return body_name == "palm" or name.startswith("palm_")
+
         for ci in range(int(self.data.ncon)):
             contact = self.data.contact[ci]
             g1, g2 = int(contact.geom1), int(contact.geom2)
             n1, n2 = geom_name(g1), geom_name(g2)
+            wrench = np.zeros(6, dtype=float)
+            self.mujoco.mj_contactForce(self.model, self.data, ci, wrench)
+            normal_force = max(float(wrench[0]), 0.0)
+            penetration = max(-float(contact.dist), 0.0)
+
+            b1 = self.geom_body_name.get(g1, "")
+            b2 = self.geom_body_name.get(g2, "")
+            hand1 = self._hand_contact_group(b1, n1)
+            hand2 = self._hand_contact_group(b2, n2)
+            palm1 = is_palm(b1, n1)
+            palm2 = is_palm(b2, n2)
+            hand_other_pair = (
+                (hand1 is not None or palm1)
+                and is_any_object_geom(n2)
+                and not is_object_geom(n2)
+            ) or (
+                (hand2 is not None or palm2)
+                and is_any_object_geom(n1)
+                and not is_object_geom(n1)
+            )
+            if hand_other_pair:
+                hand_other_object_contact = (
+                    hand_other_object_contact or normal_force > 1e-4
+                )
+                hand_other_object_force += normal_force
+                hand_other_object_geoms.add(
+                    n2 if is_any_object_geom(n2) else n1
+                )
+            object_other_pair = (
+                is_object_geom(n1)
+                and is_any_object_geom(n2)
+                and not is_object_geom(n2)
+            ) or (
+                is_object_geom(n2)
+                and is_any_object_geom(n1)
+                and not is_object_geom(n1)
+            )
+            if object_other_pair:
+                object_other_object_contact = (
+                    object_other_object_contact or normal_force > 1e-4
+                )
+                object_other_object_force += normal_force
+            hand_table_pair = (
+                n1 in {"table", "floor"} and (hand2 is not None or palm2)
+            ) or (n2 in {"table", "floor"} and (hand1 is not None or palm1))
+            if hand_table_pair:
+                hand_table_contact = hand_table_contact or normal_force > 1e-4
+                hand_table_force += normal_force
+                palm_table_contact = palm_table_contact or (
+                    normal_force > 1e-4 and (palm1 or palm2)
+                )
+            hand_support_pair = (
+                "pedestal" in n1 and (hand2 is not None or palm2)
+            ) or ("pedestal" in n2 and (hand1 is not None or palm1))
+            if hand_support_pair:
+                hand_support_contact = hand_support_contact or normal_force > 1e-4
+                hand_support_force += normal_force
+                palm_support_contact = palm_support_contact or (
+                    normal_force > 1e-4 and (palm1 or palm2)
+                )
+
             if is_object_geom(n1):
                 other_gid, other_name = g2, n2
             elif is_object_geom(n2):
@@ -805,34 +1072,67 @@ class AllegroProbeScene:
             else:
                 continue
 
-            wrench = np.zeros(6, dtype=float)
-            self.mujoco.mj_contactForce(self.model, self.data, ci, wrench)
-            normal_force = max(float(wrench[0]), 0.0)
-            max_penetration = max(max_penetration, max(-float(contact.dist), 0.0))
+            max_penetration = max(max_penetration, penetration)
 
             if other_name == support_name:
                 support_contact = support_contact or normal_force > 1e-4
                 support_force += normal_force
+                support_max_penetration = max(support_max_penetration, penetration)
                 continue
             if other_name in {"table", "floor"}:
                 table_contact = table_contact or normal_force > 1e-4
+                table_force += normal_force
+                table_max_penetration = max(table_max_penetration, penetration)
                 continue
 
             body_name = self.geom_body_name.get(other_gid, "")
             group = self._hand_contact_group(body_name, other_name)
             if group is not None:
-                hand_groups.add(group)
+                hand_object_geoms.add(n1 if is_object_geom(n1) else n2)
+                hand_contact_geoms.add(other_name)
+                hand_contact_bodies.add(body_name)
+                if normal_force > 1e-4:
+                    hand_groups.add(group)
+                hand_force_by_group[group] = (
+                    hand_force_by_group.get(group, 0.0) + normal_force
+                )
+                hand_max_penetration = max(hand_max_penetration, penetration)
                 hand_count += 1
                 hand_force += normal_force
+            elif is_palm(body_name, other_name):
+                palm_object_contact = palm_object_contact or normal_force > 1e-4
+                palm_object_force += normal_force
+                hand_max_penetration = max(hand_max_penetration, penetration)
 
         return ContactSnapshot(
             hand_groups=tuple(sorted(hand_groups)),
+            hand_force_by_group_N=tuple(sorted(hand_force_by_group.items())),
+            hand_object_geoms=tuple(sorted(hand_object_geoms)),
+            hand_contact_geoms=tuple(sorted(hand_contact_geoms)),
+            hand_contact_bodies=tuple(sorted(hand_contact_bodies)),
             hand_contact_count=hand_count,
             hand_normal_force_N=hand_force,
+            palm_object_contact=palm_object_contact,
+            palm_object_normal_force_N=palm_object_force,
             support_contact=support_contact,
             support_normal_force_N=support_force,
             table_contact=table_contact,
+            table_normal_force_N=table_force,
+            hand_table_contact=hand_table_contact,
+            hand_table_normal_force_N=hand_table_force,
+            hand_support_contact=hand_support_contact,
+            hand_support_normal_force_N=hand_support_force,
+            palm_table_contact=palm_table_contact,
+            palm_support_contact=palm_support_contact,
+            hand_other_object_contact=hand_other_object_contact,
+            hand_other_object_normal_force_N=hand_other_object_force,
+            hand_other_object_geoms=tuple(sorted(hand_other_object_geoms)),
+            object_other_object_contact=object_other_object_contact,
+            object_other_object_normal_force_N=object_other_object_force,
             max_penetration_m=max_penetration,
+            hand_max_penetration_m=hand_max_penetration,
+            support_max_penetration_m=support_max_penetration,
+            table_max_penetration_m=table_max_penetration,
         )
 
     def _hand_contact_group(self, body_name: str, geom_name: str) -> Optional[str]:

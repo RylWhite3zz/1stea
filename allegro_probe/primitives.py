@@ -67,6 +67,7 @@ class _Run:
             object_id=f"obj{self.target}",
             target=self.target,
             primitive=self.primitive,
+            scene_id=self.scene.task.scene_id,
             backend=self.backend.name,
             status=controller_status,
             valid=bool(valid),

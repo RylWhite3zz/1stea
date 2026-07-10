@@ -1,4 +1,4 @@
-"""High-level integration contracts that are intentionally not implemented yet."""
+"""Generic high-level contracts; fixed manipulation lives in a typed side module."""
 
 from __future__ import annotations
 
@@ -20,7 +20,11 @@ class ProbeCommand:
 
 @dataclass(frozen=True)
 class ManipulationCommand:
-    """Placeholder only; action vocabulary and controller are not designed."""
+    """Placeholder for a future generic vocabulary.
+
+    The implemented fixed ``short_can_pick_place`` path has stricter typed contracts
+    in :mod:`allegro_probe.manipulation` and does not consume this placeholder.
+    """
 
     name: str
     target: int
@@ -37,7 +41,7 @@ class VLMPolicy(Protocol):
 
 
 class ManipulationController(Protocol):
-    """Future execution backend for final task actions."""
+    """Future generic execution backend; one fixed Allegro path exists separately."""
 
     def execute(
         self, scene: AllegroProbeScene, command: ManipulationCommand
