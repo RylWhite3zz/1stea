@@ -26,7 +26,7 @@ v1 限定为四个 family/primitive：
 | backend | `poke/slide` | `heft/shake` |
 | --- | --- | --- |
 | `reference` | 中央仪器化探针 | 带底缘承托钩的双指参考夹爪 |
-| `allegro` | 中央仪器化探针 | Menagerie Wonik Allegro 真正的关节和碰撞体 |
+| `allegro` | 100 mm 中央仪器化探针 | 完整碰撞 Menagerie Allegro 的 top-entry 中指—拇指夹持 |
 
 创建后端：
 
@@ -67,25 +67,33 @@ approach
 
 关键 gate：
 
-- `poke`：以 `probe_force` 法向分量闭环，touch 作为接触 guard；达到目标力或
-  最大安全压入量后才形成有效曲线。
-- `slide`：PI 维持法向 preload，允许短时 touch 失联恢复；路径完成率和有效接触
-  占比都达标后才有效。
-- `heft`：`pregrasp → grasp → bounded squeeze → lift`；要求 Allegro 的拇指与
-  至少一个对向手指（或 reference 左右夹爪）形成接触，物体脱离 pedestal/table，
-  相对腕部稳定且穿透受限。
+- `poke`：以 `probe_force` 法向分量闭环；只有 contact buffer 证明中央 probe
+  接触指定 target 后才承认 touch，并将真实 probe 穿透限制为 1 mm。
+- `slide`：先建立稳定 preload，再以 PI 维持法向力；路径完成率使用实际 tip 位移，
+  允许短时失联恢复，有效 target 接触占比达标后才有效。
+- `heft`：reference 使用左右夹爪；Allegro 先在高位翻腕 `Rx(pi)`，再从物体上方
+  以中指—拇指夹住 top lip，闭环维持约 7 N 总法向力后抬升 130 mm。掌心、base、proximal、
+  非活动手指和邻物接触都不能被算成有效抓取。
 - `shake`：必须先通过与 heft 相同的抓取和脱离支撑 gate；shake 过程中重新接触
   支撑、持续丢失对向接触或掉落都会使结果无效。
 
-mass/fill 物体初始放在小型中央 pedestal 上。pedestal 比物体底面窄，不带四周
-挡墙，因此腰部、凸缘和底面外圈对侧向手指开放。物体在 reset/抓取阶段可以受
-pedestal 支撑，但进入 heft/shake 测量前必须连续确认 pedestal/table 接触消失。
+Allegro 的 mass/fill 默认让物体直接落在桌面，不使用托架；reference 为暴露底缘仍
+保留小型中央 pedestal。两条路线都必须在 heft/shake 测量前连续确认 target 已脱离
+table/pedestal。测量结束后不再空中松手：控制器先把物体放回原支撑面、完全张手、
+确认支撑稳定，再垂直退场。
 
 碰撞角色在 scene 编译时固定：
 
 - stiffness/material scene 启用中央 probe 碰撞。
-- mass/fill scene 禁用中央 probe 碰撞并启用对应 gripper/hand。
+- mass/fill scene 隐藏并禁用中央 probe 碰撞。
+- Allegro probe scene 默认编译 palm/base/proximal 在内的全部解析碰撞 proxy；视觉
+  mesh 仍是 Menagerie 的无碰撞渲染层，但不再存在“看得见却没有对应刚体 proxy”的手部。
 - primitive 运行期间不通过切换 `contype/conaffinity` 制造穿模捷径。
+- 每个仿真 step 都审计 target/非 target 接触、最深 penetration 和接触 pair；掌心、
+  手—桌、手—托架、手/target—邻物以及 probe—非 target 接触立即使结果无效。
+
+根因、几何定义、状态机 gate 和验收矩阵见
+[`docs/v1/0710/probe_collision_integrity_fix.md`](docs/v1/0710/probe_collision_integrity_fix.md)。
 
 ## ProbeResult
 
@@ -99,7 +107,7 @@ phase_reached                最后到达的状态机阶段
 violations                   超力、失联、穿透、支撑接触、滑移等
 quality                      路径完成率、接触组、漂移、抬升距离等
 features                     属性相关结构化特征
-raw_summary                  baseline 和简要诊断
+raw_summary                  baseline、逐阶段 collision maxima 和最深非法 pair
 trace                        可选完整时序
 ```
 
@@ -123,7 +131,11 @@ trace                        可选完整时序
 
 ## Allegro short_can pick/place
 
-当前唯一落地的下游动作只面向 `mass / short_can / allegro`：
+旧的 `short_can_pick_place` v1 纵向切片只面向
+`mass / short_can / allegro`。它仍使用历史 side-wrap 模板，因此只能在显式隔离的
+`allegro_grasp_lift=0.09, full_hand_collisions=False, wrist_roll_limit_rad=0.9`
+兼容 scene 中执行；安全默认 scene 会在 plan admission 阶段拒绝它。新代码不把这条
+兼容路径包装成 full-collision 抓取。
 
 ```text
 valid Allegro heft ProbeResult
@@ -140,7 +152,7 @@ valid Allegro heft ProbeResult
 ```
 
 这里的目标法向力语义固定为所有合法手—物接触法向力幅值之和；它由
-`weight_signal_N` 条件化生成。`weight_signal_N < 1.6` 的轻罐采用更低预紧、跳过
+heft 的质量/重量信号条件化生成。校准为轻罐的对象采用更低预紧、跳过
 近桌面二次纠偏，并在固定腕部下用低刚度指间笼约束物体靠重力下滑到桌面；普通/重罐
 使用更高法向力和二次纠偏后直接近表面释放。放置全程监控手—桌面力，轻/重分支分别
 在 20 N/30 N guard 处停止继续下压，40 N 为硬失败上限。最终仍要求物体直立、落在
@@ -236,8 +248,9 @@ python -m examples.run_pose_conditioned_pick_place \
 python -m pytest -q
 ```
 
-测试覆盖两个 backend、三个随机 seed、四种 primitive 的有效执行和物理排序，
-并包含无效抓取、未完成 slide、固定碰撞角色、6-DoF wrist 和脱离支撑检查。
+probe 回归覆盖两个 backend、五个随机 seed、四种 primitive、三个 target，即 120 次
+有效执行和物理排序；并逐次检查穿透、非法接触、无效抓取、未完成 slide、固定碰撞
+角色、真实 tip 坐标、6-DoF wrist、脱离支撑、错误 collision model 和拥挤邻物负例。
 `short_can_pick_place` 另外覆盖 Allegro 的 3 seed × 3 target 全网格、无效 plan
 准入、16-DoF 模板、质量条件化参数、放置稳定性和 gain 恢复。
 pose-conditioned 路径另外覆盖 SE(3) frame 约定、full-collision 编译复验、绝对固定

@@ -49,12 +49,20 @@ class SceneConfig:
     candidate_spacing: float = 0.18
     palm_height: float = 0.34
     timestep: float = 0.002
-    allegro_grasp_lift: float = 0.090
+    # Full-collision Allegro probing uses a top pinch and therefore keeps the
+    # can/cup directly on the table.  The deterministic reference jaws still
+    # need the narrow pedestal that exposes the lower rim.
+    allegro_grasp_lift: float = 0.0
+    reference_grasp_lift: float = 0.090
     short_can_place_y: float = 0.120
-    full_hand_collisions: bool = False
-    wrist_roll_limit_rad: float = 0.9
+    # Safe probe scenes compile every rigid hand proxy.  The legacy under-wrap
+    # manipulation path must explicitly request the old distal-only mode.
+    full_hand_collisions: bool = True
+    wrist_roll_limit_rad: float = np.pi
     wrist_tilt_limit_rad: float = 0.9
     wrist_yaw_limit_rad: float = 1.2
+    probe_length_m: float = 0.100
+    probe_radius_m: float = 0.005
 
     def __post_init__(self) -> None:
         if self.backend not in BACKENDS:
@@ -67,6 +75,14 @@ class SceneConfig:
             value = float(getattr(self, name))
             if not np.isfinite(value) or value <= 0.0 or value > np.pi:
                 raise ValueError(f"{name} must be finite and in (0, pi], got {value!r}")
+        if not np.isfinite(float(self.probe_length_m)) or not (
+            0.05 <= float(self.probe_length_m) <= 0.20
+        ):
+            raise ValueError("probe_length_m must be finite and in [0.05, 0.20]")
+        if not np.isfinite(float(self.probe_radius_m)) or not (
+            0.002 <= float(self.probe_radius_m) <= 0.012
+        ):
+            raise ValueError("probe_radius_m must be finite and in [0.002, 0.012]")
 
 
 @dataclass(frozen=True)
@@ -101,6 +117,25 @@ class ContactSnapshot:
     hand_max_penetration_m: float = 0.0
     support_max_penetration_m: float = 0.0
     table_max_penetration_m: float = 0.0
+    forbidden_max_penetration_m: float = 0.0
+    deepest_forbidden_pair: Tuple[str, str] = ("", "")
+
+
+@dataclass(frozen=True)
+class ProbeContactSnapshot:
+    """Exact collision-buffer facts for the instrumented central probe."""
+
+    target_contact: bool = False
+    target_normal_force_N: float = 0.0
+    target_max_penetration_m: float = 0.0
+    table_contact: bool = False
+    support_contact: bool = False
+    other_object_contact: bool = False
+    other_contact: bool = False
+    forbidden_normal_force_N: float = 0.0
+    forbidden_max_penetration_m: float = 0.0
+    deepest_pair: Tuple[str, str] = ("", "")
+    deepest_penetration_m: float = 0.0
 
 
 def _fmt(vals) -> str:
@@ -288,7 +323,11 @@ class AllegroProbeScene:
     def _object_center_z(self, obj: ObjectSpec) -> float:
         z = obj.size[2] + 0.003
         if obj.family in {"mass", "fill"}:
-            z += self.config.allegro_grasp_lift
+            z += (
+                self.config.allegro_grasp_lift
+                if self.config.backend == "allegro"
+                else self.config.reference_grasp_lift
+            )
         return float(z)
 
     def _build_xml(self) -> str:
@@ -432,9 +471,14 @@ class AllegroProbeScene:
             )
         else:
             inertia = _inertia_box(mass_shell, obj.size)
+            surface_solver = (
+                ' solref="0.017 1" solimp="0.95 0.995 0.001"'
+                if obj.family == "material"
+                else ""
+            )
             geom_xml = (
                 f'<geom name="obj{obj.index}_geom" type="box" size="{sx:.6g} {sy:.6g} {sz:.6g}" '
-                f'rgba="{rgba}" friction="{obj.friction_mu:.6g} 0.02 0.001" condim="6" priority="2"/>'
+                f'rgba="{rgba}" friction="{obj.friction_mu:.6g} 0.02 0.001" condim="6" priority="2"{surface_solver}/>'
             )
 
         liquid_xml = ""
@@ -472,6 +516,25 @@ class AllegroProbeScene:
             if self.task.family in {"stiffness", "material"}
             else 'contype="0" conaffinity="0"'
         )
+        probe_rgba = (
+            "0.9 0.15 0.10 1"
+            if self.task.family in {"stiffness", "material"}
+            else "0.9 0.15 0.10 0"
+        )
+        # The capsule itself is the visualization.  Keep the touch/frame site
+        # invisible so its volume cannot look like extra penetration.
+        probe_site_rgba = "0 0 0 0"
+        legacy_hidden_probe = bool(
+            cfg.backend == "allegro"
+            and not cfg.full_hand_collisions
+            and self.task.family in {"mass", "fill"}
+        )
+        probe_joint_damping = 8.0 if legacy_hidden_probe else 40.0
+        probe_actuator_kp = 180.0 if legacy_hidden_probe else 40.0
+        probe_body_z = 0.0 if legacy_hidden_probe else -cfg.probe_length_m
+        probe_geom_length = 0.060 if legacy_hidden_probe else cfg.probe_length_m
+        probe_site_z = 0.0 if legacy_hidden_probe else -cfg.probe_radius_m
+        probe_site_size = 0.007 if legacy_hidden_probe else 1.2 * cfg.probe_radius_m
         body = [
             f'<body name="wrist_carriage" pos="0 0 {cfg.palm_height:.6g}">',
             '<joint name="wx" type="slide" axis="1 0 0" range="-0.55 0.55" damping="60" armature="0.1"/>',
@@ -486,13 +549,16 @@ class AllegroProbeScene:
             '<site name="wrist_pose_site" pos="0 0 0" size="0.003" rgba="0 0 0 0"/>',
             palm_xml if cfg.backend == "allegro" else "",
             '<body name="probe_mount" pos="0 0 0">',
-            '<joint name="wp" type="slide" axis="0 0 -1" range="0 0.18" damping="8" armature="0.02"/>',
+            f'<joint name="wp" type="slide" axis="0 0 -1" range="0 0.18" damping="{probe_joint_damping:.12g}" armature="0.02"/>',
             inert,
-            '<body name="probe_force_body">',
+            f'<body name="probe_force_body" pos="0 0 {probe_body_z:.12g}">',
             '<site name="probe_force_site" pos="0 0 0" size="0.004"/>',
-            '<geom name="probe_tip_geom" type="capsule" fromto="0 0 0.060 0 0 0" size="0.005" '
-            f'rgba="0.9 0.15 0.10 1" friction="1.4 0.02 0.001" condim="6" {probe_collision}/>',
-            '<site name="probe_tip_site" pos="0 0 0" size="0.007" rgba="0.9 0.15 0.10 0.25"/>',
+            f'<geom name="probe_tip_geom" type="capsule" fromto="0 0 0 0 0 {probe_geom_length:.12g}" size="{cfg.probe_radius_m:.12g}" '
+            f'rgba="{probe_rgba}" friction="1.4 0.02 0.001" condim="6" '
+            f'solref="0.003 1" solimp="0.95 0.995 0.001" {probe_collision}/>',
+            # The site is the lowest physical surface of the capsule, not the
+            # endpoint sphere's centre.  All reported tip poses use this frame.
+            f'<site name="probe_tip_site" pos="0 0 {probe_site_z:.12g}" size="{probe_site_size:.12g}" rgba="{probe_site_rgba}"/>',
             '</body>',
             '</body>',
         ]
@@ -533,7 +599,7 @@ class AllegroProbeScene:
             f'<position name="act_wr" joint="wr" kp="120" ctrlrange="{-cfg.wrist_roll_limit_rad:.12g} {cfg.wrist_roll_limit_rad:.12g}"/>',
             f'<position name="act_wt" joint="wt" kp="120" ctrlrange="{-cfg.wrist_tilt_limit_rad:.12g} {cfg.wrist_tilt_limit_rad:.12g}"/>',
             f'<position name="act_wyaw" joint="wyaw" kp="80" ctrlrange="{-cfg.wrist_yaw_limit_rad:.12g} {cfg.wrist_yaw_limit_rad:.12g}"/>',
-            '<position name="act_wp" joint="wp" kp="180" ctrlrange="0 0.18"/>',
+            f'<position name="act_wp" joint="wp" kp="{probe_actuator_kp:.12g}" ctrlrange="0 0.18"/>',
         ]
         if cfg.backend == "reference":
             act.extend([
@@ -932,10 +998,109 @@ class AllegroProbeScene:
         }
 
     def wz_for_tip_z(self, z_world: float, probe_extension: float = 0.0) -> float:
-        return float(np.clip(z_world - self.config.palm_height + probe_extension, -0.55, 0.14))
+        return float(
+            np.clip(
+                z_world
+                - self.config.palm_height
+                + self.config.probe_length_m
+                + self.config.probe_radius_m
+                + probe_extension,
+                -0.55,
+                0.14,
+            )
+        )
 
     def relative_object_position(self, i: int) -> np.ndarray:
         return self.object_pos(i) - self.wrist_pos()
+
+    def probe_contact_snapshot(self, i: int) -> ProbeContactSnapshot:
+        """Classify all contacts made by the central probe collision capsule."""
+
+        probe_gid = self.geom.get("probe_tip_geom")
+        if probe_gid is None:
+            return ProbeContactSnapshot()
+        object_prefix = f"obj{i}_"
+        support_name = f"obj{i}_pedestal"
+        target_contact = False
+        target_force = 0.0
+        target_penetration = 0.0
+        table_contact = False
+        support_contact = False
+        other_object_contact = False
+        other_contact = False
+        forbidden_force = 0.0
+        forbidden_penetration = 0.0
+        deepest_pair = ("", "")
+        deepest_penetration = 0.0
+
+        def geom_name(gid: int) -> str:
+            return (
+                self.mujoco.mj_id2name(
+                    self.model, self.mujoco.mjtObj.mjOBJ_GEOM, int(gid)
+                )
+                or ""
+            )
+
+        def is_target(name: str) -> bool:
+            return (
+                name.startswith(object_prefix)
+                and name != support_name
+                and "pedestal" not in name
+                and "hidden_liquid" not in name
+            )
+
+        def is_any_object(name: str) -> bool:
+            return (
+                name.startswith("obj")
+                and "pedestal" not in name
+                and "hidden_liquid" not in name
+            )
+
+        for ci in range(int(self.data.ncon)):
+            contact = self.data.contact[ci]
+            g1, g2 = int(contact.geom1), int(contact.geom2)
+            if g1 != probe_gid and g2 != probe_gid:
+                continue
+            n1, n2 = geom_name(g1), geom_name(g2)
+            other_name = n2 if g1 == probe_gid else n1
+            wrench = np.zeros(6, dtype=float)
+            self.mujoco.mj_contactForce(self.model, self.data, ci, wrench)
+            normal_force = max(float(wrench[0]), 0.0)
+            penetration = max(-float(contact.dist), 0.0)
+            if penetration > deepest_penetration:
+                deepest_penetration = penetration
+                deepest_pair = (n1, n2)
+            if is_target(other_name):
+                target_contact = target_contact or normal_force > 1e-4
+                target_force += normal_force
+                target_penetration = max(target_penetration, penetration)
+                continue
+            forbidden_force += normal_force
+            forbidden_penetration = max(forbidden_penetration, penetration)
+            if other_name in {"table", "floor"}:
+                table_contact = table_contact or normal_force > 1e-4
+            elif other_name == support_name or "pedestal" in other_name:
+                support_contact = support_contact or normal_force > 1e-4
+            elif is_any_object(other_name):
+                other_object_contact = (
+                    other_object_contact or normal_force > 1e-4
+                )
+            else:
+                other_contact = other_contact or normal_force > 1e-4
+
+        return ProbeContactSnapshot(
+            target_contact=target_contact,
+            target_normal_force_N=target_force,
+            target_max_penetration_m=target_penetration,
+            table_contact=table_contact,
+            support_contact=support_contact,
+            other_object_contact=other_object_contact,
+            other_contact=other_contact,
+            forbidden_normal_force_N=forbidden_force,
+            forbidden_max_penetration_m=forbidden_penetration,
+            deepest_pair=deepest_pair,
+            deepest_penetration_m=deepest_penetration,
+        )
 
     def contact_snapshot(self, i: int) -> ContactSnapshot:
         """Summarize actual MuJoCo contacts involving one object.
@@ -974,6 +1139,8 @@ class AllegroProbeScene:
         hand_max_penetration = 0.0
         support_max_penetration = 0.0
         table_max_penetration = 0.0
+        forbidden_max_penetration = 0.0
+        deepest_forbidden_pair = ("", "")
 
         def geom_name(gid: int) -> str:
             return (
@@ -1065,6 +1232,19 @@ class AllegroProbeScene:
                     normal_force > 1e-4 and (palm1 or palm2)
                 )
 
+            palm_target_pair = (
+                palm1 and is_object_geom(n2)
+            ) or (palm2 and is_object_geom(n1))
+            if (
+                hand_other_pair
+                or object_other_pair
+                or hand_table_pair
+                or hand_support_pair
+                or palm_target_pair
+            ) and penetration > forbidden_max_penetration:
+                forbidden_max_penetration = penetration
+                deepest_forbidden_pair = (n1, n2)
+
             if is_object_geom(n1):
                 other_gid, other_name = g2, n2
             elif is_object_geom(n2):
@@ -1133,6 +1313,8 @@ class AllegroProbeScene:
             hand_max_penetration_m=hand_max_penetration,
             support_max_penetration_m=support_max_penetration,
             table_max_penetration_m=table_max_penetration,
+            forbidden_max_penetration_m=forbidden_max_penetration,
+            deepest_forbidden_pair=deepest_forbidden_pair,
         )
 
     def _hand_contact_group(self, body_name: str, geom_name: str) -> Optional[str]:
