@@ -32,6 +32,7 @@ from allegro_probe.pose_manipulation import (
 )
 from allegro_probe.primitives import primitive_for_family, run_probe
 from allegro_probe.protocols import (
+    EXECUTOR_PROFILE_VERSION,
     FEATURE_SCHEMA_VERSION,
     PROBE_PROTOCOL_ID,
     V1_DEFAULTS,
@@ -49,6 +50,7 @@ __all__ = [
     "ManipulationPlanDecision",
     "POSE_MANIPULATION_SCHEMA_VERSION",
     "FEATURE_SCHEMA_VERSION",
+    "EXECUTOR_PROFILE_VERSION",
     "FixedPlaceSpec",
     "GraspCandidate",
     "ObjectSpec",

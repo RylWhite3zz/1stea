@@ -13,6 +13,9 @@ from typing import Mapping
 
 PROBE_PROTOCOL_ID = "probebench.probe.v1"
 FEATURE_SCHEMA_VERSION = "allegro_probe.features.v2"
+# Package/executor compatibility identity.  v3 is the first profile in which
+# material slide is fingertip-only for both backends.
+EXECUTOR_PROFILE_VERSION = "allegro_probe.executor.v3"
 
 
 DEFAULT_PROBE_MODES: Mapping[str, str] = MappingProxyType(
@@ -70,9 +73,10 @@ class ProbeProtocolDefaults:
     # ramp/analysis/return waveform. It raises the planned target; it does not
     # relax the live geometric gate.
     shake_dynamic_sag_reserve_m: float = 0.00150
-    slide_preload_N: float = 2.0
-    slide_one_way_distance_m: float = 0.040
-    slide_one_way_duration_s: float = 0.8
+    slide_preload_N: float = 0.6
+    slide_force_limit_N: float = 1.2
+    slide_one_way_distance_m: float = 0.020
+    slide_one_way_duration_s: float = 2.0
 
 
 V1_DEFAULTS = ProbeProtocolDefaults()

@@ -53,13 +53,13 @@ class _SceneBackend:
 
 
 class ReferenceProbeBackend(_SceneBackend):
-    """Instrumented probe plus a deterministic two-jaw reference gripper."""
+    """Reference poke tool plus fingertip pad and deterministic two-jaw gripper."""
 
     name = "reference"
 
 
 class AllegroHandBackend(_SceneBackend):
-    """Wonik Allegro hand with an instrumented wrist probe."""
+    """Wonik Allegro hand with fingertip poke/slide sensing and wrist F/T."""
 
     name = "allegro"
 

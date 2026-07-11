@@ -1,8 +1,9 @@
 """MuJoCo scene shared by reference-rig and Allegro probe backends.
 
-Both variants use a 6-DoF wrist carriage. Reference ``poke`` and both ``slide`` paths
-use an instrumented central probe; Allegro ``poke`` uses its index fingertip.
-``heft`` and ``shake`` use either a reference gripper or articulated Allegro.
+Both variants use a 6-DoF wrist carriage. Reference ``poke`` uses the instrumented
+central probe. Allegro ``poke`` and ``slide`` use its index fingertip; reference
+``slide`` uses a dedicated left fingertip pad. ``heft`` and ``shake`` use either
+a reference gripper or articulated Allegro.
 """
 
 from __future__ import annotations
@@ -409,18 +410,19 @@ class AllegroProbeScene:
 """.strip()
 
     def _contact_xml(self, allegro_contact: str, use_allegro: bool) -> str:
-        if not use_allegro:
-            return ""
         probe_excludes = []
-        for body in (
-            "palm", "ff_base", "ff_proximal", "ff_medial", "ff_distal", "ff_tip",
-            "mf_base", "mf_proximal", "mf_medial", "mf_distal", "mf_tip",
-            "rf_base", "rf_proximal", "rf_medial", "rf_distal", "rf_tip",
-            "th_base", "th_proximal", "th_medial", "th_distal", "th_tip",
-        ):
-            probe_excludes.append(f'<exclude body1="probe_force_body" body2="{body}"/>')
+        if use_allegro:
+            for body in (
+                "palm", "ff_base", "ff_proximal", "ff_medial", "ff_distal", "ff_tip",
+                "mf_base", "mf_proximal", "mf_medial", "mf_distal", "mf_tip",
+                "rf_base", "rf_proximal", "rf_medial", "rf_distal", "rf_tip",
+                "th_base", "th_proximal", "th_medial", "th_distal", "th_tip",
+            ):
+                probe_excludes.append(
+                    f'<exclude body1="probe_force_body" body2="{body}"/>'
+                )
         fingertip_pairs = []
-        if self.task.family == "stiffness":
+        if self.task.family == "stiffness" and use_allegro:
             for obj in self.task.objects:
                 fingertip_pairs.append(
                     f'<pair geom1="ff_tip_fingertip_collision" '
@@ -428,6 +430,25 @@ class AllegroProbeScene:
                     'friction="3.5 3.5 0.06 0.004 0.004" '
                     'solref="0.004 1" solimp="0.95 0.995 0.001"/>'
                 )
+        elif self.task.family == "material":
+            # Pair parameters override the generic high-friction grasp proxies.
+            # This is essential: the measured slide contact must use each
+            # candidate's friction_mu rather than the hand/pad default.
+            effector_geom = (
+                "ff_tip_fingertip_collision"
+                if use_allegro
+                else "ref_left_slide_pad_geom"
+            )
+            for obj in self.task.objects:
+                mu = float(obj.friction_mu)
+                fingertip_pairs.append(
+                    f'<pair geom1="{effector_geom}" '
+                    f'geom2="obj{obj.index}_geom" condim="3" '
+                    f'friction="{mu:.12g} {mu:.12g} 0 0 0" '
+                    'solref="0.017 1" solimp="0.95 0.995 0.001"/>'
+                )
+        if not (allegro_contact or probe_excludes or fingertip_pairs):
+            return ""
         return (
             f"<contact>{allegro_contact}{''.join(probe_excludes)}"
             f"{''.join(fingertip_pairs)}</contact>"
@@ -545,12 +566,10 @@ class AllegroProbeScene:
     def _carriage_xml(self, palm_xml: str) -> Tuple[str, str, str]:
         cfg = self.config
         inert = '<inertial pos="0 0 0" mass="0.08" diaginertia="8e-5 8e-5 8e-5"/>'
+        # The central probe is now a reference-stiffness-only tool. Both slide
+        # backends use a real fingertip/pad and Allegro poke uses ff_tip.
         central_probe_active = bool(
-            self.task.family == "material"
-            or (
-                self.task.family == "stiffness"
-                and cfg.backend == "reference"
-            )
+            self.task.family == "stiffness" and cfg.backend == "reference"
         )
         probe_collision = (
             'contype="1" conaffinity="1"'
@@ -610,6 +629,17 @@ class AllegroProbeScene:
                 if self.task.family in {"mass", "fill"}
                 else 'contype="0" conaffinity="0"'
             )
+            reference_slide_active = self.task.family == "material"
+            slide_pad_collision = (
+                'contype="1" conaffinity="1"'
+                if reference_slide_active
+                else 'contype="0" conaffinity="0"'
+            )
+            slide_pad_rgba = (
+                "0.85 0.55 0.18 1"
+                if reference_slide_active
+                else "0.85 0.55 0.18 0"
+            )
             body.extend([
                 '<body name="ref_left_jaw" pos="0 -0.060 0">',
                 '<joint name="ref_left_close" type="slide" axis="0 1 0" range="0 0.040" damping="4"/>',
@@ -619,6 +649,17 @@ class AllegroProbeScene:
                 f'size="0.012 0.006 0.003" friction="2.0 0.03 0.002" condim="6" '
                 f'rgba="0.15 0.45 0.8 1" {jaw_collision}/>',
                 '<site name="ref_left_touch_site" pos="0 0.008 0" size="0.014 0.010 0.030" type="box"/>',
+                # A dedicated single-finger surface pad for reference slide.
+                # It is physically absent from mass/fill contact because its
+                # collision mask is compiled per family below.
+                '<geom name="ref_left_slide_pad_geom" type="capsule" '
+                'fromto="-0.006 0 -0.034 0.006 0 -0.034" size="0.006" '
+                f'friction="1.4 0.02 0.001" condim="6" rgba="{slide_pad_rgba}" '
+                f'{slide_pad_collision}/>',
+                '<site name="ref_left_slide_touch_site" type="box" pos="0 0 -0.034" '
+                'size="0.014 0.008 0.008" rgba="0 0 0 0"/>',
+                '<site name="ref_left_slide_pad_site" pos="0 0 -0.040" '
+                'size="0.001" rgba="0 0 0 0"/>',
                 '</body>',
                 '<body name="ref_right_jaw" pos="0 0.060 0">',
                 '<joint name="ref_right_close" type="slide" axis="0 -1 0" range="0 0.040" damping="4"/>',
@@ -675,6 +716,9 @@ class AllegroProbeScene:
             sensors.extend([
                 '<touch name="ref_left_touch" site="ref_left_touch_site"/>',
                 '<touch name="ref_right_touch" site="ref_right_touch_site"/>',
+                '<touch name="ref_left_slide_touch" site="ref_left_slide_touch_site"/>',
+                '<framepos name="ref_left_slide_pad_pos" objtype="site" '
+                'objname="ref_left_slide_pad_site"/>',
                 '<jointactuatorfrc name="ref_left_actuatorfrc" joint="ref_left_close"/>',
                 '<jointactuatorfrc name="ref_right_actuatorfrc" joint="ref_right_close"/>',
             ])
@@ -791,19 +835,17 @@ class AllegroProbeScene:
     def set_probe_collision(self, enabled: bool) -> None:
         """Compatibility shim.
 
-        Probe collision is fixed when the model is compiled: enabled for reference
-        stiffness and all material scenes, disabled for Allegro stiffness and all
-        mass/fill scenes. Runtime collision spoofing is deliberately rejected.
+        Probe collision is fixed when the model is compiled: enabled only for
+        reference stiffness, and disabled for Allegro stiffness plus every
+        mass/fill/material scene. Runtime collision spoofing is deliberately
+        rejected.
         """
         gid = self.geom.get("probe_tip_geom")
         if gid is None:
             return
         expected = bool(
-            self.task.family == "material"
-            or (
-                self.task.family == "stiffness"
-                and self.config.backend == "reference"
-            )
+            self.task.family == "stiffness"
+            and self.config.backend == "reference"
         )
         if bool(enabled) != expected:
             raise RuntimeError(
@@ -1110,6 +1152,22 @@ class AllegroProbeScene:
         if value not in {"ff", "mf", "rf", "th"}:
             raise ValueError("prefix must be one of ff/mf/rf/th")
         return float(self.sensor(f"{value}_tip_touch")[0])
+
+    def reference_slide_touch(self) -> float:
+        """Return the dedicated reference fingertip-pad touch signal."""
+
+        if self.config.backend != "reference":
+            raise RuntimeError("reference_slide_touch requires backend='reference'")
+        return float(self.sensor("ref_left_slide_touch")[0])
+
+    def reference_slide_pad_pos(self) -> np.ndarray:
+        """Return the physical bottom-surface site of the reference slide pad."""
+
+        if self.config.backend != "reference":
+            raise RuntimeError(
+                "reference_slide_pad_pos requires backend='reference'"
+            )
+        return self.sensor("ref_left_slide_pad_pos")
 
     def fingertip_positions(self) -> Dict[str, np.ndarray]:
         if self.config.backend == "reference":

@@ -25,8 +25,8 @@ v1 限定为四个 family/primitive：
 
 | backend | `poke/slide` | `heft/shake` |
 | --- | --- | --- |
-| `reference` | `poke/slide` 均用中央仪器化探针 | 带底缘承托钩的双指参考夹爪 |
-| `allegro` | `poke` 用食指指腹触觉；`slide` 用中央仪器化探针 | 完整碰撞 Menagerie Allegro 的 top-entry 中指—拇指夹持 |
+| `reference` | `poke` 用中央仪器化探针；`slide` 用左侧专用指腹 pad | 带底缘承托钩的双指参考夹爪 |
+| `allegro` | `poke/slide` 均用食指 `ff_tip` 与指尖触觉 | 完整碰撞 Menagerie Allegro 的 top-entry 中指—拇指夹持 |
 
 创建后端：
 
@@ -71,8 +71,12 @@ approach
   只允许 `ff_tip_fingertip_collision` 接触指定 target，并以 `ff_tip_touch` 闭环。
   Allegro 默认目标/上限为 0.8/1.0 N，目标穿透上限 0.5 mm；非目标手指、指节、
   掌面、桌面、邻物或中央 probe 接触均立即无效。
-- `slide`：先建立稳定 preload，再以 PI 维持法向力；路径完成率使用实际 tip 位移，
-  允许短时失联恢复，有效 target 接触占比达标后才有效。
+- `slide`：两套后端都先用单个实体指腹建立稳定 preload，再以 wrist-z PI 维持法向
+  触觉读数，并由 wrist-x 执行 20 mm、10 mm/s 的往返；路径完成率使用实际指腹位移。
+  Allegro 只允许 `ff_tip_fingertip_collision`，reference 只允许
+  `ref_left_slide_pad_geom`。切向力来自 baseline-corrected wrist F/T，摩擦统计排除
+  起步、换向和端点瞬态。持续失联、持续超力、物体平移超过 3 mm 或有效接触占比不足
+  都会使结果无效。
 - `heft`：reference 使用左右夹爪；Allegro 在高位翻腕 `Rx(pi)`，从上方以中指—拇指
   夹住 top lip。腕部最多允许移动 35 mm，但停止条件看物体几何中心的实际抬升：
   默认 8 mm、20 mm/s、连续脱离支撑 120 ms、目标带稳定 80 ms。测量是 200 ms
@@ -91,9 +95,11 @@ table/pedestal。测量结束后不再空中松手：控制器先把物体放回
 
 碰撞角色在 scene 编译时固定：
 
-- reference stiffness 与两个 backend 的 material scene 启用中央 probe 碰撞；
-  Allegro stiffness scene 隐藏并禁用中央 probe，只启用食指指腹接触。
-- mass/fill scene 隐藏并禁用中央 probe 碰撞。
+- 只有 reference stiffness scene 启用中央 probe 碰撞。
+- Allegro stiffness 以及两个 backend 的 mass/fill/material scene 都隐藏并禁用中央
+  probe；material 仅启用该 backend 的单个 slide 指腹。
+- 每个 material target 都显式建立“指腹—表面”接触 pair，pair 的切向摩擦系数取该
+  target 的 `friction_mu`，避免 Allegro 指尖的通用高摩擦参数覆盖被测物性。
 - Allegro probe scene 默认编译 palm/base/proximal 在内的全部解析碰撞 proxy；视觉
   mesh 仍是 Menagerie 的无碰撞渲染层，但不再存在“看得见却没有对应刚体 proxy”的手部。
 - primitive 运行期间不通过切换 `contype/conaffinity` 制造穿模捷径。
@@ -134,7 +140,7 @@ trace                        可选完整时序
 - wrist 六轴 joint position/velocity
 - 物体 position/quaternion
 - Allegro fingertip touch/position、actuator force、`jointactuatorfrc`
-- reference 左右夹爪 touch 和 `jointactuatorfrc`
+- reference 左右夹爪 touch、slide pad touch/position 和 `jointactuatorfrc`
 - 直接从 MuJoCo contact buffer 得到的手指分组、pedestal/table 接触、法向力和
   penetration
 - manipulation 额外区分每指法向力、手接触到的物体 geom，以及手—桌面/手—托架

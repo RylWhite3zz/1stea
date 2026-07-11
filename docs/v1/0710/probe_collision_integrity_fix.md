@@ -27,19 +27,26 @@ hand-other-object、hand-table、palm-object 等接触；retreat 发生在有效
 
 ### 3.1 `poke / slide`
 
-- reference `poke` 与两个 backend 的 `slide` 使用中央 probe；它的有效长度为
-  100 mm、半径为 5 mm；`probe_tip_pos()` 是 capsule 最下方
-  物理表面，`wz_for_tip_z()` 与这个 frame 精确互逆。
+- 只有 reference `poke` 使用中央 probe；它的有效长度为 100 mm、半径为 5 mm；
+  `probe_tip_pos()` 是 capsule 最下方物理表面，`wz_for_tip_z()` 与这个 frame 精确
+  互逆。
 - Allegro `poke` 不再用中央 probe：stiffness scene 在编译时将其隐藏并禁碰，手在
   高位翻到 `Rx(pi)` 后，以实时对齐的 `ff_tip` 和 `ff_tip_touch` 执行法向力闭环。
   仅 `ff_tip_fingertip_collision` 可以接触 target，穿透硬上限 0.5 mm。
-- probe position joint 使用 `damping=40`、actuator 使用 `kp=40`；material 接触面使用
-  `solref="0.017 1"`，降低 position servo 把工具硬压入表面的数值穿透。
+- 两个 `slide` 都改成单指腹：Allegro 复用 `ff_tip/ff_tip_touch`；reference 在左 jaw
+  末端使用专用 `ref_left_slide_pad_geom/ref_left_slide_touch`。material scene 的中央
+  probe 在 XML 编译时透明且禁碰，`wp=0` 全程不参与控制。
+- slide 先以低速 guarded descent 检出首次真实指腹接触，再通过 wrist-z 触觉闭环建立
+  0.6 N preload；wrist-x 以 10 mm/s 执行 20 mm 的 `start→end→start`。两腿完成率
+  来自实际指腹 site 的 x 位移，切向力来自 baseline-corrected wrist F/T，中段准匀速
+  样本才进入摩擦估计。
+- 每个 material target 都有显式 `condim=3` 指腹接触 pair，其两轴滑动摩擦取对象
+  `friction_mu`，防止 Allegro 通用指尖的 `friction=3.5, priority=3` 覆盖被测值。
+- material 接触面使用 `solref="0.017 1"`；指腹穿透硬上限为 0.8 mm，持续超力、持续
+  失联、目标平移超过 3 mm 或接触占比不足均失败。
 - `probe_contact_snapshot(target)` 必须证明 probe 接触的是指定 target；probe—桌面、
-  托架、其他候选或其他 geom 均失败。
-- central-probe 路径中手/掌不能接触 target，真实 probe 穿透硬上限为 1 mm。
-- slide 在横移前建立 30 步稳定 preload；执行 `start→end→start`，两腿完成率都来自
-  实际 tip x 位移。末端有界 servo settling 不混入摩擦统计窗口。
+  托架、其他候选或其他 geom 均失败；这条只适用于 reference `poke`。
+- central-probe `poke` 中手/掌不能接触 target，真实 probe 穿透硬上限为 1 mm。
 
 ### 3.2 Allegro `heft / shake`
 
@@ -70,8 +77,8 @@ reference 后端仍使用真实可见且可碰撞的左右 jaw/hook 和窄 pedes
 - hand—table、hand—pedestal；
 - hand—其他候选、target—其他候选；
 - probe—非 target；
-- central-probe `poke/slide` 中任何 hand—target；Allegro fingertip `poke` 中任何非
-  `ff_tip_fingertip_collision` 的 hand—target；
+- central-probe `poke` 中任何 hand—target；Allegro fingertip `poke/slide` 中任何非
+  `ff_tip_fingertip_collision`、reference `slide` 中任何非专用左指腹的 hand—target；
 - `heft/shake` 中任何 probe—target；
 - Allegro grasp 中 ff/rf、base/proximal 或非白名单 link 接触。
 

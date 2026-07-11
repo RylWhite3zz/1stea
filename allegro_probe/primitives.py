@@ -55,8 +55,9 @@ _PROBE_CONTACT_PHASES = frozenset(
         "retreat",
     }
 )
-_FINGERTIP_POKE_GEOM = "ff_tip_fingertip_collision"
-_FINGERTIP_POKE_PHASES = _PROBE_CONTACT_PHASES
+_ALLEGRO_SURFACE_FINGERTIP_GEOM = "ff_tip_fingertip_collision"
+_REFERENCE_SLIDE_PAD_GEOM = "ref_left_slide_pad_geom"
+_FINGERTIP_PROBE_PHASES = _PROBE_CONTACT_PHASES
 _ALLEGRO_POKE_PRESHAPE = np.asarray(
     [
         0.00, 0.80, 0.80, 0.50,
@@ -238,25 +239,34 @@ class _Run:
             self.fail("forbidden_penetration_limit")
 
         hand_target_contact = bool(hand.hand_contact_geoms)
-        allegro_fingertip_poke = bool(
-            self.primitive == "poke" and self.backend.name == "allegro"
+        fingertip_surface_probe = bool(
+            (self.primitive == "poke" and self.backend.name == "allegro")
+            or self.primitive == "slide"
         )
-        if allegro_fingertip_poke:
+        if fingertip_surface_probe:
             if probe.target_contact:
                 self.fail("probe_target_collision")
             if hand_target_contact:
-                if self.phase not in _FINGERTIP_POKE_PHASES:
+                if self.phase not in _FINGERTIP_PROBE_PHASES:
                     self.fail("unexpected_hand_contact")
                 # MuJoCo can retain a zero-force contact row for one step while
                 # separating; in that case contact_geoms is populated but the
                 # force-thresholded hand_groups tuple is empty.
-                if set(hand.hand_groups) - {"ff"}:
+                allowed_group = (
+                    "ff" if self.backend.name == "allegro" else "left"
+                )
+                allowed_geom = (
+                    _ALLEGRO_SURFACE_FINGERTIP_GEOM
+                    if self.backend.name == "allegro"
+                    else _REFERENCE_SLIDE_PAD_GEOM
+                )
+                if set(hand.hand_groups) - {allowed_group}:
                     self.fail("inactive_finger_contact")
-                if set(hand.hand_contact_geoms) != {_FINGERTIP_POKE_GEOM}:
+                if set(hand.hand_contact_geoms) != {allowed_geom}:
                     self.fail("forbidden_hand_link_contact")
             if hand.hand_max_penetration_m > self.target_penetration_limit_m:
                 self.fail("fingertip_penetration_limit")
-        elif self.primitive in {"poke", "slide"}:
+        elif self.primitive == "poke":
             if hand_target_contact:
                 self.fail("hand_target_collision")
             if probe.target_contact and self.phase not in _PROBE_CONTACT_PHASES:
@@ -1452,7 +1462,25 @@ def _place_and_retreat(run: _Run, grasp: _Grasp, *, object_lifted: bool) -> bool
 def _legal_fingertip_poke_contact(snapshot: ContactSnapshot) -> bool:
     return bool(
         set(snapshot.hand_groups) == {"ff"}
-        and set(snapshot.hand_contact_geoms) == {_FINGERTIP_POKE_GEOM}
+        and set(snapshot.hand_contact_geoms)
+        == {_ALLEGRO_SURFACE_FINGERTIP_GEOM}
+        and not snapshot.palm_object_contact
+    )
+
+
+def _legal_fingertip_slide_contact(
+    run: _Run, snapshot: ContactSnapshot
+) -> bool:
+    if run.backend.name == "allegro":
+        return bool(
+            set(snapshot.hand_groups) == {"ff"}
+            and set(snapshot.hand_contact_geoms)
+            == {_ALLEGRO_SURFACE_FINGERTIP_GEOM}
+            and not snapshot.palm_object_contact
+        )
+    return bool(
+        set(snapshot.hand_groups) == {"left"}
+        and set(snapshot.hand_contact_geoms) == {_REFERENCE_SLIDE_PAD_GEOM}
         and not snapshot.palm_object_contact
     )
 
@@ -1769,7 +1797,9 @@ def _poke_with_allegro_fingertip(
             "n_hold_samples": len(hold_force),
             "contact_z": contact_z,
             "force_baseline": force_baseline,
-            "contact_geom_whitelist": [_FINGERTIP_POKE_GEOM],
+            "contact_geom_whitelist": [
+                _ALLEGRO_SURFACE_FINGERTIP_GEOM
+            ],
         },
         valid=valid,
     )
@@ -3053,13 +3083,129 @@ def shake(
     )
 
 
+def _slide_fingertip_touch(run: _Run) -> float:
+    scene = run.scene
+    if run.backend.name == "allegro":
+        return scene.fingertip_touch("ff")
+    return scene.reference_slide_touch()
+
+
+def _slide_fingertip_pos(run: _Run) -> np.ndarray:
+    scene = run.scene
+    if run.backend.name == "allegro":
+        return scene.fingertip_positions()["ff"]
+    return scene.reference_slide_pad_pos()
+
+
+def _prepare_fingertip_slide(
+    run: _Run, *, start_x: float
+) -> Tuple[bool, np.ndarray]:
+    """Place one physical fingertip/pad above the slide start point."""
+
+    scene = run.scene
+    target_top = scene.object_pos(run.target).copy()
+    desired_tip = target_top.copy()
+    desired_tip[0] = float(start_x)
+    desired_tip[1] = 0.0
+    desired_tip[2] += 0.035
+
+    run.enter("approach")
+    if run.backend.name == "allegro":
+        if not scene.full_hand_collisions_compiled():
+            run.fail("full_hand_collisions_required")
+        if not run.violations:
+            _move_allegro_hand(run, _ALLEGRO_POKE_PRESHAPE, 160)
+        if not run.violations:
+            _move_wrist(
+                run,
+                steps=220,
+                x=float(start_x),
+                y=0.0,
+                z=0.12,
+                probe=0.0,
+            )
+        if not run.violations:
+            _move_wrist(
+                run,
+                steps=300,
+                roll=float(np.pi),
+                tilt=0.0,
+                yaw=0.0,
+            )
+    else:
+        # The reference pad is mounted 60 mm to the left of the wrist. Shift
+        # the wrist so that this single pad, not the opposite jaw, is centred.
+        scene.command(grip=0.0, probe=0.0)
+        _move_wrist(
+            run,
+            steps=260,
+            x=float(start_x),
+            y=0.060,
+            z=0.10,
+            roll=0.0,
+            tilt=0.0,
+            yaw=0.0,
+            probe=0.0,
+        )
+
+    # Calibrate from the live contact-site pose so changes to Allegro or the
+    # reference-pad mount do not create a hidden hard-coded fingertip offset.
+    for _ in range(2):
+        if run.violations:
+            break
+        tip = _slide_fingertip_pos(run)
+        _move_wrist(
+            run,
+            steps=260,
+            x=_ctrl(scene, "act_wx") + float(desired_tip[0] - tip[0]),
+            y=_ctrl(scene, "act_wy") + float(desired_tip[1] - tip[1]),
+            z=_ctrl(scene, "act_wz") + float(desired_tip[2] - tip[2]),
+            roll=(float(np.pi) if run.backend.name == "allegro" else 0.0),
+            tilt=0.0,
+            yaw=0.0,
+            probe=0.0,
+        )
+    force_baseline = (
+        _mean_vec(run, scene.wrist_force_vec, 40)
+        if not run.violations
+        else np.zeros(3, dtype=float)
+    )
+    return not run.violations, force_baseline
+
+
+def _safe_fingertip_slide_retreat(run: _Run) -> bool:
+    if run.backend.name == "allegro":
+        return _safe_fingertip_retreat(run)
+
+    scene = run.scene
+    run.enter("retreat")
+    moved = _move_wrist(
+        run,
+        steps=240,
+        z=0.10,
+        roll=0.0,
+        tilt=0.0,
+        yaw=0.0,
+        probe=0.0,
+    )
+    clear = bool(
+        scene.reference_slide_touch() <= 1e-4
+        and not scene.contact_snapshot(run.target).hand_groups
+    )
+    if not clear:
+        run.fail("fingertip_not_clear_after_retreat")
+    run.enter("post_retreat_check")
+    settled = run.step(20)
+    return bool(moved and clear and settled)
+
+
 def slide(
     executor: ProbeBackend | AllegroProbeScene,
     target: int,
     preload: float = V1_DEFAULTS.slide_preload_N,
     distance: float = V1_DEFAULTS.slide_one_way_distance_m,
     duration: float = V1_DEFAULTS.slide_one_way_duration_s,
-    force_limit: float = 12.0,
+    force_limit: float = V1_DEFAULTS.slide_force_limit_N,
     recovery_steps: int = 30,
     *,
     mode: str | None = None,
@@ -3073,8 +3219,20 @@ def slide(
         mode=canonical_probe_mode("slide", mode),
         protocol_id=validate_protocol_id(protocol_id),
     )
-    run.sensor_profile_id = "sim.central_probe_touch+probe_ft.v1"
-    run.target_penetration_limit_m = 0.001
+    if backend.name == "allegro":
+        run.sensor_profile_id = "sim.allegro_ff_tip_touch+wrist_ft.v1"
+        effector_name = "ff_tip"
+        sensor_name = "ff_tip_touch"
+        contact_geom = _ALLEGRO_SURFACE_FINGERTIP_GEOM
+    else:
+        run.sensor_profile_id = "sim.reference_left_slide_touch+wrist_ft.v1"
+        effector_name = "left_fingertip_pad"
+        sensor_name = "ref_left_slide_touch"
+        contact_geom = _REFERENCE_SLIDE_PAD_GEOM
+    # The material surface intentionally uses a compliant contact solver. Keep
+    # the fingertip below the former 1 mm central-probe envelope while allowing
+    # the 0.6 N preload to settle without a solver-only false positive.
+    run.target_penetration_limit_m = 0.0008
     scene = run.scene
     preload = _finite("preload", preload)
     distance = _finite("distance", distance)
@@ -3100,29 +3258,30 @@ def slide(
     x0 = scene.candidate_x(run.target)
     start_x = x0 - 0.5 * distance
 
-    run.enter("approach")
-    approached = _probe_above(run, x=start_x, clearance=0.030)
-    force_baseline = (
-        _mean_vec(run, scene.probe_force_vec, 40)
-        if approached and not run.violations
-        else np.zeros(3, dtype=float)
+    approached, force_baseline = _prepare_fingertip_slide(
+        run, start_x=start_x
     )
 
     run.enter("guarded_contact")
-    extension = 0.0
+    z_command = _ctrl(scene, "act_wz")
     contacted = False
-    for extension in (
-        np.linspace(0.0, 0.17, 120) if not run.violations else ()
-    ):
-        scene.command(probe=float(extension))
-        if not run.step(4):
+    max_guard_steps = max(1, int(np.ceil(0.050 / 0.00004)))
+    for _ in range(max_guard_steps if approached else 0):
+        z_command -= 0.00004
+        scene.command(z=z_command, probe=0.0)
+        if not run.step(3):
             break
-        fn = scene.probe_touch()
-        contact = scene.probe_contact_snapshot(run.target)
+        fn = _slide_fingertip_touch(run)
+        contact = scene.contact_snapshot(run.target)
         if fn > force_limit:
             run.fail("force_limit")
             break
-        if fn >= 0.8 * preload and contact.target_contact:
+        # Detect first physical touch early.  The following quality phase ramps
+        # to preload in feedback; descending open-loop to the final force causes
+        # the stiff carriage servo to overshoot while its position catches up.
+        if fn >= min(0.15, 0.25 * preload) and _legal_fingertip_slide_contact(
+            run, contact
+        ):
             contacted = True
             break
     if not contacted and not run.violations:
@@ -3131,8 +3290,8 @@ def slide(
     run.enter("contact_quality_gate")
     integral = 0.0
     lost_count = 0
-    trace = []
-    completed_steps = 0
+    overload_count = 0
+    trace: List[Tuple[float, np.ndarray, float, bool, str]] = []
     max_lost_count = 0
     actual_path_fraction = 0.0
     return_path_fraction = 0.0
@@ -3140,219 +3299,198 @@ def slide(
     return_endpoint_settle_steps = 0
     return_error_m = abs(float(distance))
     start_tip_x = float("nan")
+    max_object_displacement_m = 0.0
+    object_start = scene.object_center_pos(run.target).copy()
     if contacted and not run.violations:
         stable_contact_steps = 0
         stable_forces = []
-        for _ in range(30):
+        for _ in range(240):
+            fn = _slide_fingertip_touch(run)
+            error = preload - fn
+            integral = float(
+                np.clip(integral + error * scene.dt, -0.5, 0.5)
+            )
+            dz = float(
+                np.clip(
+                    2.5e-5 * error + 4.0e-6 * integral,
+                    -1.2e-5,
+                    2.5e-5,
+                )
+            )
+            z_command = float(
+                np.clip(
+                    z_command - dz,
+                    *scene.model.actuator_ctrlrange[scene.act["act_wz"]],
+                )
+            )
+            scene.command(z=z_command, probe=0.0)
             if not run.step(1):
                 break
-            contact = scene.probe_contact_snapshot(run.target)
-            fn = scene.probe_touch()
+            contact = scene.contact_snapshot(run.target)
+            fn = _slide_fingertip_touch(run)
             stable_forces.append(fn)
-            if contact.target_contact and fn >= 0.4 * preload:
+            if (
+                _legal_fingertip_slide_contact(run, contact)
+                and 0.80 * preload <= fn <= 1.20 * preload
+            ):
                 stable_contact_steps += 1
             else:
                 stable_contact_steps = 0
-        run.quality["preload_stable_fraction"] = stable_contact_steps / 30.0
-        if stable_contact_steps < 24:
+            if fn > force_limit:
+                run.fail("force_limit")
+                break
+            if stable_contact_steps >= 40:
+                break
+        run.quality["preload_stable_fraction"] = min(
+            stable_contact_steps / 40.0, 1.0
+        )
+        if stable_contact_steps < 40:
             run.fail("unstable_preload")
         if stable_forces:
             run.quality["preload_force_std_N"] = float(np.std(stable_forces))
-        start_tip_x = float(scene.probe_tip_pos()[0])
-        run.enter("primitive_execution")
-        for k, alpha in enumerate(np.linspace(0.0, 1.0, n)):
-            fn = scene.probe_touch()
-            error = preload - fn
-            integral = float(np.clip(integral + error * scene.dt, -2.0, 2.0))
-            extension = float(
-                np.clip(extension + 0.00025 * error + 0.00008 * integral, 0.0, 0.17)
+
+    if contacted and not run.violations:
+        start_tip_x = float(_slide_fingertip_pos(run)[0])
+        start_wrist_x = _ctrl(scene, "act_wx")
+        z_ctrl_range = np.asarray(
+            scene.model.actuator_ctrlrange[scene.act["act_wz"]], dtype=float
+        )
+
+        def command_contact(*, x: float) -> None:
+            nonlocal integral, z_command
+            fn_now = _slide_fingertip_touch(run)
+            error = preload - fn_now
+            integral = float(
+                np.clip(integral + error * scene.dt, -0.5, 0.5)
             )
-            scene.command(x=start_x + float(alpha) * distance, probe=extension)
-            if not run.step(1):
-                break
-            fn = scene.probe_touch()
-            fvec = scene.probe_force_vec() - force_baseline
-            ft = float(np.linalg.norm(fvec[:2]))
-            if fn < 0.2 * preload:
+            dz = float(
+                np.clip(
+                    2.5e-5 * error + 4.0e-6 * integral,
+                    -1.2e-5,
+                    2.5e-5,
+                )
+            )
+            z_command = float(np.clip(z_command - dz, *z_ctrl_range))
+            scene.command(x=float(x), z=z_command, probe=0.0)
+
+        def record_sample(
+            *, leg: str, commanded_fraction: float, origin_x: float
+        ) -> float:
+            nonlocal lost_count, overload_count, max_lost_count
+            nonlocal max_object_displacement_m
+            fn_now = _slide_fingertip_touch(run)
+            fvec = scene.wrist_force_vec() - force_baseline
+            ft_now = float(np.linalg.norm(fvec[:2]))
+            snapshot = scene.contact_snapshot(run.target)
+            legal = _legal_fingertip_slide_contact(run, snapshot)
+            if fn_now < 0.2 * preload or not legal:
                 lost_count += 1
             else:
                 lost_count = 0
             max_lost_count = max(max_lost_count, lost_count)
-            actual_path_fraction = float(
+            fraction = float(
                 np.clip(
-                    abs(float(scene.probe_tip_pos()[0]) - start_tip_x)
+                    abs(float(_slide_fingertip_pos(run)[0]) - origin_x)
                     / max(abs(distance), 1e-9),
                     0.0,
                     1.0,
                 )
             )
-            target_contact = scene.probe_contact_snapshot(run.target).target_contact
-            trace.append(
-                (fn, fvec.copy(), actual_path_fraction, target_contact, "outbound")
+            max_object_displacement_m = max(
+                max_object_displacement_m,
+                float(
+                    np.linalg.norm(
+                        scene.object_center_pos(run.target)[:2]
+                        - object_start[:2]
+                    )
+                ),
             )
+            trace.append((fn_now, fvec.copy(), fraction, legal, leg))
             run.sample(
-                normal_force_N=fn,
-                tangential_force_N=ft,
-                commanded_path_fraction=float(alpha),
-                path_fraction=actual_path_fraction,
-                path_leg="outbound",
+                effector=effector_name,
+                normal_force_N=fn_now,
+                tangential_force_N=ft_now,
+                wrist_force_delta_N=fvec,
+                commanded_path_fraction=float(commanded_fraction),
+                path_fraction=fraction,
+                path_leg=leg,
+                legal_contact=legal,
             )
-            if fn > force_limit:
+            # A single-step complementarity impulse is not a sustained unsafe
+            # load. Require 10 ms above the limit, while still preserving the
+            # unfiltered peak in the collision audit.
+            overload_count = overload_count + 1 if fn_now > force_limit else 0
+            if overload_count >= 5:
                 run.fail("force_limit")
-                break
             if lost_count > recovery_steps:
                 run.fail("lost_contact")
-                break
-            completed_steps = k + 1
+            return fraction
 
-        # Position servos lag the command endpoint.  Keep the final x target and
-        # preload controller active for a bounded settling window, and judge the
-        # path from the measured tip pose rather than command interpolation.
-        for _ in range(200):
+        run.enter("primitive_execution")
+        for alpha in np.linspace(0.0, 1.0, n):
+            command_contact(x=start_wrist_x + float(alpha) * distance)
+            if not run.step(1):
+                break
+            actual_path_fraction = record_sample(
+                leg="outbound",
+                commanded_fraction=float(alpha),
+                origin_x=start_tip_x,
+            )
+            if run.violations:
+                break
+
+        # Measured fingertip pose, rather than actuator command, is the endpoint
+        # criterion. A small bounded lead compensates position-servo lag.
+        servo_lead = 0.004 * (1.0 if distance >= 0.0 else -1.0)
+        for settle_index in range(200):
             if actual_path_fraction >= 0.95 or run.violations:
                 break
-            fn = scene.probe_touch()
-            error = preload - fn
-            integral = float(np.clip(integral + error * scene.dt, -2.0, 2.0))
-            extension = float(
-                np.clip(
-                    extension + 0.00025 * error + 0.00008 * integral,
-                    0.0,
-                    0.17,
-                )
+            lead_alpha = min((settle_index + 1) / 80.0, 1.0)
+            command_contact(
+                x=start_wrist_x + distance + lead_alpha * servo_lead
             )
-            servo_lead = 0.008 * (1.0 if distance >= 0.0 else -1.0)
-            scene.command(x=start_x + distance + servo_lead, probe=extension)
             if not run.step(1):
                 break
             endpoint_settle_steps += 1
-            fn = scene.probe_touch()
-            fvec = scene.probe_force_vec() - force_baseline
-            ft = float(np.linalg.norm(fvec[:2]))
-            if fn < 0.2 * preload:
-                lost_count += 1
-            else:
-                lost_count = 0
-            max_lost_count = max(max_lost_count, lost_count)
-            actual_path_fraction = float(
-                np.clip(
-                    abs(float(scene.probe_tip_pos()[0]) - start_tip_x)
-                    / max(abs(distance), 1e-9),
-                    0.0,
-                    1.0,
-                )
+            actual_path_fraction = record_sample(
+                leg="outbound",
+                commanded_fraction=1.0,
+                origin_x=start_tip_x,
             )
-            if fn > force_limit:
-                run.fail("force_limit")
-                break
-            if lost_count > recovery_steps:
-                run.fail("lost_contact")
-                break
 
-        forward_tip_x = float(scene.probe_tip_pos()[0])
+        forward_tip_x = float(_slide_fingertip_pos(run)[0])
         if actual_path_fraction >= 0.95 and not run.violations:
+            lost_count = 0
             for alpha in np.linspace(0.0, 1.0, n):
-                fn = scene.probe_touch()
-                error = preload - fn
-                integral = float(
-                    np.clip(integral + error * scene.dt, -2.0, 2.0)
-                )
-                extension = float(
-                    np.clip(
-                        extension + 0.00025 * error + 0.00008 * integral,
-                        0.0,
-                        0.17,
-                    )
-                )
-                scene.command(
-                    x=start_x + (1.0 - float(alpha)) * distance,
-                    probe=extension,
+                command_contact(
+                    x=start_wrist_x + (1.0 - float(alpha)) * distance
                 )
                 if not run.step(1):
                     break
-                fn = scene.probe_touch()
-                fvec = scene.probe_force_vec() - force_baseline
-                ft = float(np.linalg.norm(fvec[:2]))
-                if fn < 0.2 * preload:
-                    lost_count += 1
-                else:
-                    lost_count = 0
-                max_lost_count = max(max_lost_count, lost_count)
-                return_path_fraction = float(
-                    np.clip(
-                        abs(float(scene.probe_tip_pos()[0]) - forward_tip_x)
-                        / max(abs(distance), 1e-9),
-                        0.0,
-                        1.0,
-                    )
+                return_path_fraction = record_sample(
+                    leg="return",
+                    commanded_fraction=float(alpha),
+                    origin_x=forward_tip_x,
                 )
-                target_contact = scene.probe_contact_snapshot(
-                    run.target
-                ).target_contact
-                trace.append(
-                    (
-                        fn,
-                        fvec.copy(),
-                        return_path_fraction,
-                        target_contact,
-                        "return",
-                    )
-                )
-                run.sample(
-                    normal_force_N=fn,
-                    tangential_force_N=ft,
-                    commanded_path_fraction=float(alpha),
-                    path_fraction=return_path_fraction,
-                    path_leg="return",
-                )
-                if fn > force_limit:
-                    run.fail("force_limit")
-                    break
-                if lost_count > recovery_steps:
-                    run.fail("lost_contact")
+                if run.violations:
                     break
 
-            for _ in range(200):
+            for settle_index in range(200):
                 if return_path_fraction >= 0.95 or run.violations:
                     break
-                fn = scene.probe_touch()
-                error = preload - fn
-                integral = float(
-                    np.clip(integral + error * scene.dt, -2.0, 2.0)
-                )
-                extension = float(
-                    np.clip(
-                        extension + 0.00025 * error + 0.00008 * integral,
-                        0.0,
-                        0.17,
-                    )
-                )
-                servo_lead = 0.008 * (1.0 if distance >= 0.0 else -1.0)
-                scene.command(x=start_x - servo_lead, probe=extension)
+                lead_alpha = min((settle_index + 1) / 80.0, 1.0)
+                command_contact(x=start_wrist_x - lead_alpha * servo_lead)
                 if not run.step(1):
                     break
                 return_endpoint_settle_steps += 1
-                fn = scene.probe_touch()
-                if fn < 0.2 * preload:
-                    lost_count += 1
-                else:
-                    lost_count = 0
-                max_lost_count = max(max_lost_count, lost_count)
-                return_path_fraction = float(
-                    np.clip(
-                        abs(float(scene.probe_tip_pos()[0]) - forward_tip_x)
-                        / max(abs(distance), 1e-9),
-                        0.0,
-                        1.0,
-                    )
+                return_path_fraction = record_sample(
+                    leg="return",
+                    commanded_fraction=1.0,
+                    origin_x=forward_tip_x,
                 )
-                if fn > force_limit:
-                    run.fail("force_limit")
-                    break
-                if lost_count > recovery_steps:
-                    run.fail("lost_contact")
-                    break
-            return_error_m = abs(float(scene.probe_tip_pos()[0]) - start_tip_x)
+            return_error_m = abs(
+                float(_slide_fingertip_pos(run)[0]) - start_tip_x
+            )
 
     run.enter("post_check")
     completion = min(actual_path_fraction, return_path_fraction)
@@ -3365,38 +3503,62 @@ def slide(
     run.quality["return_endpoint_settle_steps"] = float(
         return_endpoint_settle_steps
     )
+    run.quality["max_object_xy_displacement_m"] = max_object_displacement_m
     if completion < 0.95:
         run.fail("path_incomplete")
     if return_error_m > 0.10 * abs(distance):
         run.fail("round_trip_return_error")
+    # A surface probe that pushes the candidate around has not measured the
+    # intended local material property, even if the carriage completed its path.
+    if max_object_displacement_m > 0.003:
+        run.fail("object_displacement_limit")
 
     if trace:
         fn_arr = np.asarray([item[0] for item in trace])
         force_arr = np.asarray([item[1] for item in trace])
+        path_arr = np.asarray([item[2] for item in trace])
         ft_arr = np.linalg.norm(force_arr[:, :2], axis=1)
-        mask = np.asarray([bool(item[3]) for item in trace], dtype=bool) & (
-            fn_arr > 1e-4
-        )
-        if mask.any():
-            mu = float(np.median(ft_arr[mask] / (fn_arr[mask] + 1e-6)))
-            ft_median = float(np.median(ft_arr[mask]))
-            fn_median = float(np.median(fn_arr[mask]))
-            vibration = float(np.std(fn_arr[mask]))
-            contact_fraction = float(mask.mean())
-            outbound_mask = mask & np.asarray(
+        contact_mask = np.asarray(
+            [bool(item[3]) for item in trace], dtype=bool
+        ) & (fn_arr > 1e-4)
+        # Exclude reversal/endpoint transients from the friction estimate while
+        # retaining every sample for contact-completion diagnostics.
+        steady_mask = contact_mask & (path_arr >= 0.10) & (path_arr <= 0.90)
+        contact_fraction = float(contact_mask.mean())
+        if steady_mask.any():
+            ratio = ft_arr[steady_mask] / (fn_arr[steady_mask] + 1e-6)
+            mu = float(np.median(ratio))
+            ft_median = float(np.median(ft_arr[steady_mask]))
+            fn_median = float(np.median(fn_arr[steady_mask]))
+            vibration = float(np.std(fn_arr[steady_mask]))
+            outbound_mask = steady_mask & np.asarray(
                 [item[4] == "outbound" for item in trace], dtype=bool
             )
-            return_mask = mask & np.asarray(
+            return_mask = steady_mask & np.asarray(
                 [item[4] == "return" for item in trace], dtype=bool
             )
-            mu_outbound = float(
-                np.median(ft_arr[outbound_mask] / (fn_arr[outbound_mask] + 1e-6))
-            ) if outbound_mask.any() else 0.0
-            mu_return = float(
-                np.median(ft_arr[return_mask] / (fn_arr[return_mask] + 1e-6))
-            ) if return_mask.any() else 0.0
+            mu_outbound = (
+                float(
+                    np.median(
+                        ft_arr[outbound_mask]
+                        / (fn_arr[outbound_mask] + 1e-6)
+                    )
+                )
+                if outbound_mask.any()
+                else 0.0
+            )
+            mu_return = (
+                float(
+                    np.median(
+                        ft_arr[return_mask]
+                        / (fn_arr[return_mask] + 1e-6)
+                    )
+                )
+                if return_mask.any()
+                else 0.0
+            )
         else:
-            mu = ft_median = fn_median = vibration = contact_fraction = 0.0
+            mu = ft_median = fn_median = vibration = 0.0
             mu_outbound = mu_return = 0.0
     else:
         mu = ft_median = fn_median = vibration = contact_fraction = 0.0
@@ -3406,7 +3568,7 @@ def slide(
         run.fail("insufficient_contact_fraction")
     valid = not run.violations
 
-    retreat_ok = _safe_probe_retreat(run)
+    retreat_ok = _safe_fingertip_slide_retreat(run)
     valid = valid and retreat_ok and not run.violations
     run.phase = "complete" if valid else "retreat"
     return run.result(
@@ -3423,14 +3585,23 @@ def slide(
         contact_seconds=len(trace) * scene.dt,
         params={
             "preload": preload,
+            "force_limit": force_limit,
             "distance": distance,
             "duration": duration,
             "round_trip": True,
             "recovery_steps": recovery_steps,
+            "force_limit_dwell_steps": 5,
+            "effector": effector_name,
+            "sensor": sensor_name,
+            "tangential_force_source": "wrist_force",
         },
         raw_summary={
             "n_samples": len(trace),
             "force_baseline": force_baseline,
+            "contact_geom_whitelist": [contact_geom],
+            "central_probe_collision_enabled": bool(
+                scene.model.geom_contype[scene.geom["probe_tip_geom"]] != 0
+            ),
         },
         valid=valid,
     )

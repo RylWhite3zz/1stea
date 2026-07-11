@@ -39,6 +39,9 @@ def test_full_pose_and_fixed_collision_roles(backend: str) -> None:
     mass = AllegroProbeScene(
         make_demo_scene("mass", 2, 0), SceneConfig(backend=backend)
     )
+    material = AllegroProbeScene(
+        make_demo_scene("material", 3, 0), SceneConfig(backend=backend)
+    )
 
     for joint in ("wx", "wy", "wz", "wr", "wt", "wyaw"):
         assert f"{joint}_pos" in stiff.sensor_names
@@ -59,6 +62,40 @@ def test_full_pose_and_fixed_collision_roles(backend: str) -> None:
 
     probe_gid = mass.geom["probe_tip_geom"]
     assert mass.model.geom_rgba[probe_gid, 3] == pytest.approx(0.0)
+    material_probe_gid = material.geom["probe_tip_geom"]
+    assert material.model.geom_contype[material_probe_gid] == 0
+    assert material.model.geom_rgba[material_probe_gid, 3] == pytest.approx(0.0)
+    if backend == "reference":
+        assert material.model.geom_contype[
+            material.geom["ref_left_slide_pad_geom"]
+        ] != 0
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_material_contact_pairs_use_each_objects_friction(backend: str) -> None:
+    spec = make_demo_scene("material", 3, 0)
+    scene = AllegroProbeScene(spec, SceneConfig(backend=backend))
+    effector = (
+        "ff_tip_fingertip_collision"
+        if backend == "allegro"
+        else "ref_left_slide_pad_geom"
+    )
+    effector_gid = scene.geom[effector]
+    pair_by_object = {}
+    for pair_index in range(scene.model.npair):
+        geom1 = int(scene.model.pair_geom1[pair_index])
+        geom2 = int(scene.model.pair_geom2[pair_index])
+        if effector_gid not in {geom1, geom2}:
+            continue
+        object_gid = geom2 if geom1 == effector_gid else geom1
+        pair_by_object[object_gid] = pair_index
+    assert len(pair_by_object) == len(spec.objects)
+    for obj in spec.objects:
+        pair_index = pair_by_object[scene.geom[f"obj{obj.index}_geom"]]
+        assert scene.model.pair_dim[pair_index] == 3
+        assert scene.model.pair_friction[pair_index, :2] == pytest.approx(
+            [obj.friction_mu, obj.friction_mu]
+        )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -289,6 +326,35 @@ def test_four_primitives_are_valid_and_physically_ordered(
                 assert result.quality["max_probe_target_penetration_m"] == 0.0
                 assert result.quality["max_hand_target_penetration_m"] <= 0.0005
                 assert result.quality["peak_hand_target_force_N"] <= 1.0
+            elif family == "material":
+                expected = {
+                    "allegro": (
+                        "ff_tip",
+                        "ff_tip_touch",
+                        "sim.allegro_ff_tip_touch+wrist_ft.v1",
+                        "ff_tip_fingertip_collision",
+                    ),
+                    "reference": (
+                        "left_fingertip_pad",
+                        "ref_left_slide_touch",
+                        "sim.reference_left_slide_touch+wrist_ft.v1",
+                        "ref_left_slide_pad_geom",
+                    ),
+                }[backend]
+                assert result.params["effector"] == expected[0]
+                assert result.params["sensor"] == expected[1]
+                assert result.params["tangential_force_source"] == "wrist_force"
+                assert result.sensor_profile_id == expected[2]
+                assert result.raw_summary["contact_geom_whitelist"] == [
+                    expected[3]
+                ]
+                assert not result.raw_summary[
+                    "central_probe_collision_enabled"
+                ]
+                assert result.quality["max_probe_target_penetration_m"] == 0.0
+                assert result.quality["peak_probe_target_force_N"] == 0.0
+                assert result.quality["max_hand_target_penetration_m"] <= 0.0008
+                assert result.quality["max_object_xy_displacement_m"] <= 0.003
             else:
                 assert result.quality["max_hand_target_penetration_m"] == 0.0
                 assert result.quality["max_probe_target_penetration_m"] <= 0.001

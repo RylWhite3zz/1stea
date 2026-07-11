@@ -250,8 +250,11 @@ content 标定作复数差分后，才有资格命名纯 slosh gain。旧 `fill_
 
 ## 5. `slide`：往返而非单程
 
-`round_trip_force_control` 先建立 preload，执行 `start → end → start` 两段，每段均用
-相同法向力闭环，并用实际 probe tip 位移而非命令插值验收。有效条件包括：
+`round_trip_force_control` 不再使用中央 probe。Allegro 以
+`ff_tip/ff_tip_touch`、reference 以专用左指腹 pad/touch 建立 0.6 N preload；两者都
+通过 wrist-z 闭环维持法向触觉读数，再由 wrist-x 以 10 mm/s 执行
+`start → end → start` 两段 20 mm 路径。验收使用实际 fingertip site 位移而非命令
+插值。material scene 中中央 probe 透明、禁碰且 `wp=0`。有效条件包括：
 
 ```text
 outbound completion >= 0.95
@@ -259,9 +262,18 @@ return completion   >= 0.95
 return error        <= one-way distance 的 10%
 target contact fraction >= 0.80
 无超力、持续失联、邻物/环境碰撞
+目标平面位移 <= 3 mm
 ```
 
-结果保留合并 `friction_ratio`，同时给出 outbound/return 比值和方向不对称诊断。
+法向力来自指腹 touch，切向力来自接触前 baseline-corrected wrist F/T。摩擦估计仅使用
+每条腿 10%–90% 的准匀速中段，排除起步、换向与端点伺服瞬态。每个 target 的显式
+`condim=3` 指腹接触 pair 使用其 `friction_mu`；结果保留合并 `friction_ratio`，同时
+给出 outbound/return 比值和方向不对称诊断。两后端 sensor profile 分别为：
+
+```text
+sim.allegro_ff_tip_touch+wrist_ft.v1
+sim.reference_left_slide_touch+wrist_ft.v1
+```
 
 ## 6. 等质量内容物 proxy
 
@@ -319,6 +331,7 @@ Allegro fingertip poke 仅 ff_tip 接触及 <0.5 mm penetration
 等质量 fixed/damped/mobile 动态可分
 shake 回零、支撑重接触和相对位姿 gate
 round-trip slide 两腿完成
+material 中央 probe 零接触，且仅声明的 slide 指腹 geom 可接触 target
 failed grasp / max wrist travel / partial collision / neighbour collision 负例
 invalid feature 不进入 ProbeBench trusted observation
 T-Force 拒绝 Allegro fingertip poke
