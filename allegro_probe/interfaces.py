@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Protocol
 
-from allegro_probe.backends import ProbeBackend, as_backend
+from allegro_probe.backends import (
+    BackendScene,
+    ProbeBackend,
+    as_backend,
+    require_supported_primitive,
+)
 from allegro_probe.models import ProbeResult
 from allegro_probe.primitives import run_probe
 from allegro_probe.protocols import PROBE_PROTOCOL_ID, validate_protocol_id
@@ -56,11 +61,14 @@ class ManipulationController(Protocol):
 class ProbeHarness:
     """The currently implemented high-level boundary: execute one probe command."""
 
-    def __init__(self, executor: ProbeBackend | AllegroProbeScene):
+    def __init__(self, executor: ProbeBackend | BackendScene):
         self.backend = as_backend(executor)
         self.scene = self.backend.scene
 
     def execute(self, command: ProbeCommand) -> ProbeResult:
+        # This gate must precede protocol parsing and primitive dispatch: a new
+        # embodiment starts with no inherited carriage semantics.
+        require_supported_primitive(self.backend, command.primitive)
         protocol_id = validate_protocol_id(command.protocol_id)
         params = dict(command.params)
         if "protocol_id" in params:

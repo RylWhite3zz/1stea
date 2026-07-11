@@ -7,7 +7,11 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 
-from allegro_probe.backends import ProbeBackend, as_backend
+from allegro_probe.backends import (
+    ProbeBackend,
+    as_backend,
+    require_supported_primitive,
+)
 from allegro_probe.models import ProbeResult, canonical_family
 from allegro_probe.protocols import (
     FEATURE_SCHEMA_VERSION,
@@ -1819,6 +1823,7 @@ def poke(
     protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
+    require_supported_primitive(backend, "poke")
     run = _Run(
         backend,
         "poke",
@@ -2077,6 +2082,7 @@ def heft(
     protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
+    require_supported_primitive(backend, "heft")
     run = _Run(
         backend,
         "heft",
@@ -2304,6 +2310,7 @@ def shake(
     protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
+    require_supported_primitive(backend, "shake")
     run = _Run(
         backend,
         "shake",
@@ -3212,6 +3219,7 @@ def slide(
     protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
+    require_supported_primitive(backend, "slide")
     run = _Run(
         backend,
         "slide",
@@ -3628,6 +3636,7 @@ def run_probe(
         raise ValueError(
             f"unknown probe primitive {primitive!r}; expected {sorted(_DISPATCH)}"
         )
+    require_supported_primitive(backend, primitive)
     expected = primitive_for_family(backend.scene.task.family)
     if primitive != expected:
         raise ValueError(

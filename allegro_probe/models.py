@@ -12,7 +12,14 @@ from allegro_probe.protocols import FEATURE_SCHEMA_VERSION, PROBE_PROTOCOL_ID
 
 FAMILIES = ("stiffness", "mass", "fill", "material")
 FAMILY_ALIASES = {"smoothness": "material"}
-BACKENDS = ("reference", "allegro")
+
+# ``AllegroProbeScene`` implements the original carriage-based simulator only.
+# Keep that narrower set separate from the registered execution backends so a
+# newly registered robot embodiment cannot accidentally fall through one of
+# the carriage scene's ``reference`` branches.
+CARRIAGE_BACKENDS = ("reference", "allegro")
+FRANKA_ALLEGRO_MUJOCO_BACKEND = "franka_allegro_mujoco"
+BACKENDS = (*CARRIAGE_BACKENDS, FRANKA_ALLEGRO_MUJOCO_BACKEND)
 
 
 def canonical_family(family: str) -> str:

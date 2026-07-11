@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "allegro-probe"
-version = "0.3.0"
-description = "Validated MuJoCo probe primitives with reference-rig and Allegro-hand backends"
+version = "0.4.0"
+description = "Validated MuJoCo probe primitives and a staged Panda-Allegro backend"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mujoco>=3.1",
+    "mujoco>=3.3.1",
     "numpy>=1.24",
 ]
 
@@ -20,6 +20,7 @@ dev = ["pytest>=7.0"]
 allegro-probe-demo = "examples.run_probe_demo:main"
 allegro-short-can-pick-place = "examples.run_short_can_pick_place:main"
 allegro-pose-pick-place = "examples.run_pose_conditioned_pick_place:main"
+allegro-franka-stage1 = "examples.run_franka_allegro_stage1:main"
 
 [tool.setuptools.packages.find]
 include = ["allegro_probe*", "examples*"]

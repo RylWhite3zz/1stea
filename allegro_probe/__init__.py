@@ -1,9 +1,30 @@
 """Validated MuJoCo probe primitives and narrow Allegro manipulation paths."""
 
-from allegro_probe.backends import AllegroHandBackend, ProbeBackend, ReferenceProbeBackend
+from allegro_probe.backends import (
+    AllegroHandBackend,
+    BackendCapabilities,
+    FrankaAllegroMujocoBackend,
+    ProbeBackend,
+    ReferenceProbeBackend,
+    UnsupportedPrimitiveError,
+    create_backend,
+)
 from allegro_probe.demo_scenes import make_demo_scene
 from allegro_probe.interfaces import ProbeCommand, ProbeHarness
 from allegro_probe.geometry import RigidTransform
+from allegro_probe.franka_scene import (
+    CANONICAL_ALLEGRO_OPEN,
+    CANONICAL_PANDA_HOME,
+    CANONICAL_Q,
+    SYNTHETIC_MOUNT_V1,
+    CollisionSnapshot as RobotCollisionSnapshot,
+    DistanceAudit,
+    FramePose,
+    FrankaAllegroScene,
+    FrankaSceneConfig,
+    ModelProvenance,
+    SyntheticMountProfile,
+)
 from allegro_probe.manipulation import (
     AllegroHandTemplate,
     ManipulationContext,
@@ -44,10 +65,20 @@ __all__ = [
     "AllegroProbeScene",
     "AllegroHandBackend",
     "AllegroHandTemplate",
+    "BackendCapabilities",
+    "CANONICAL_ALLEGRO_OPEN",
+    "CANONICAL_PANDA_HOME",
+    "CANONICAL_Q",
+    "DistanceAudit",
+    "FramePose",
+    "FrankaAllegroMujocoBackend",
+    "FrankaAllegroScene",
+    "FrankaSceneConfig",
     "ManipulationContext",
     "ManipulationExecutionResult",
     "ManipulationPlan",
     "ManipulationPlanDecision",
+    "ModelProvenance",
     "POSE_MANIPULATION_SCHEMA_VERSION",
     "FEATURE_SCHEMA_VERSION",
     "EXECUTOR_PROFILE_VERSION",
@@ -65,13 +96,18 @@ __all__ = [
     "PoseConditionedPickPlaceRequest",
     "PoseConditionedShortCanController",
     "RigidTransform",
+    "RobotCollisionSnapshot",
     "SceneConfig",
     "ShortCanPickPlaceRequest",
     "ReferenceProbeBackend",
+    "SYNTHETIC_MOUNT_V1",
+    "SyntheticMountProfile",
+    "UnsupportedPrimitiveError",
     "PROBE_PROTOCOL_ID",
     "V1_DEFAULTS",
     "make_demo_scene",
     "build_short_can_pick_place_plan",
+    "create_backend",
     "build_pose_conditioned_short_can_plan",
     "execute_pose_conditioned_short_can_plan",
     "execute_short_can_pick_place",

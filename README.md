@@ -21,12 +21,14 @@ v1 限定为四个 family/primitive：
 
 ## 执行后端
 
-两个后端共享相同命令、状态机、传感语义和结果结构：
+当前注册三个并列后端。前两个共享 probe 命令、状态机、传感语义和结果结构；第三个
+处于 Panda+Allegro 接入的模型验收阶段：
 
 | backend | `poke/slide` | `heft/shake` |
 | --- | --- | --- |
 | `reference` | `poke` 用中央仪器化探针；`slide` 用左侧专用指腹 pad | 带底缘承托钩的双指参考夹爪 |
 | `allegro` | `poke/slide` 均用食指 `ff_tip` 与指尖触觉 | 完整碰撞 Menagerie Allegro 的 top-entry 中指—拇指夹持 |
+| `franka_allegro_mujoco` | 阶段 1 仅提供 Panda 7-DoF + Allegro 16-DoF 模型、joint control、FK 和自碰撞审计 | `supported_primitives=()`；尚不执行 probe/manipulation |
 
 创建后端：
 
@@ -47,6 +49,20 @@ result = ProbeHarness(backend).execute(ProbeCommand("heft", target=1))
 旧的 `ProbeHarness(AllegroProbeScene(...))` 调用仍然支持，scene 会根据
 `SceneConfig.backend` 自动适配为对应 backend。
 
+第三后端使用独立 `FrankaAllegroScene`，不经过旧 carriage scene，也不提供伪造的
+`scene.command(x/y/z/roll/tilt/yaw)`。阶段 1 自动验收可运行：
+
+```bash
+conda run -n probebench python -m examples.run_franka_allegro_stage1
+# 逐个观察 7+16 actuator 小动作：
+conda run -n probebench python -m examples.run_franka_allegro_stage1 --viewer
+```
+
+设计边界、验收口径与下一阶段调研分别见
+[`docs/v2/0711/stage1_franka_allegro_backend_design.md`](docs/v2/0711/stage1_franka_allegro_backend_design.md)、
+[`docs/v2/0711/stage1_acceptance_and_usage.md`](docs/v2/0711/stage1_acceptance_and_usage.md) 和
+[`docs/v2/0711/next_stage_research.md`](docs/v2/0711/next_stage_research.md)。
+
 ## 控制与有效性
 
 四种原语统一采用显式分阶段控制：
@@ -61,7 +77,8 @@ approach
 → retreat
 ```
 
-这里的 wrist 是 MuJoCo 中的 6-DoF task-space carriage：`x/y/z + roll/tilt/yaw`。
+对两个已实现 probe 原语的后端，这里的 wrist 是 MuJoCo 中的 6-DoF task-space carriage：
+`x/y/z + roll/tilt/yaw`。
 各阶段在预先定义的目标位姿之间平滑插值，并根据接触、力和超时条件转移。它不是
 机械臂、IK、关节空间避碰或 MPC 规划。
 
@@ -221,7 +238,7 @@ penetration。固定目标按三维中心误差、目标轴倾角、稳定性和
 依赖：
 
 - Python 3.10+
-- MuJoCo 3.1+
+- MuJoCo 3.3.1+（第三 backend 使用 `MjSpec` attachment API）
 - NumPy
 - Allegro 后端需要 MuJoCo Menagerie 的 `wonik_allegro/right_hand.xml`
 

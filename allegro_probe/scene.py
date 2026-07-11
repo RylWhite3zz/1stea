@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from allegro_probe.geometry import quaternion_wxyz_to_matrix
-from allegro_probe.models import BACKENDS, ObjectSpec, ProbeSceneSpec
+from allegro_probe.models import CARRIAGE_BACKENDS, ObjectSpec, ProbeSceneSpec
 
 
 DEFAULT_MENAGERIE_ROOT = Path("/home/enovo/robots/sim/mujoco_menagerie/wonik_allegro")
@@ -67,8 +67,11 @@ class SceneConfig:
     probe_radius_m: float = 0.005
 
     def __post_init__(self) -> None:
-        if self.backend not in BACKENDS:
-            raise ValueError(f"backend must be one of {BACKENDS}, got {self.backend!r}")
+        if self.backend not in CARRIAGE_BACKENDS:
+            raise ValueError(
+                "AllegroProbeScene backend must be one of "
+                f"{CARRIAGE_BACKENDS}, got {self.backend!r}"
+            )
         for name in (
             "wrist_roll_limit_rad",
             "wrist_tilt_limit_rad",
