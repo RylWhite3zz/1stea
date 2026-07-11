@@ -9,6 +9,13 @@ import numpy as np
 
 from allegro_probe.backends import ProbeBackend, as_backend
 from allegro_probe.models import ProbeResult, canonical_family
+from allegro_probe.protocols import (
+    FEATURE_SCHEMA_VERSION,
+    PROBE_PROTOCOL_ID,
+    V1_DEFAULTS,
+    canonical_probe_mode,
+    validate_protocol_id,
+)
 from allegro_probe.scene import (
     AllegroProbeScene,
     ContactSnapshot,
@@ -27,10 +34,14 @@ _GRASP_CONTACT_PHASES = frozenset(
         "contact_establish",
         "contact_quality_gate",
         "wrist_ft_baseline",
+        "height_stabilization",
+        "dynamic_baseline",
         "lift",
         "primitive_execution",
         "measurement",
         "post_check",
+        "return_to_zero",
+        "post_zero_check",
         "reorient_for_place",
         "place_descent",
         "release",
@@ -43,6 +54,17 @@ _PROBE_CONTACT_PHASES = frozenset(
         "primitive_execution",
         "retreat",
     }
+)
+_FINGERTIP_POKE_GEOM = "ff_tip_fingertip_collision"
+_FINGERTIP_POKE_PHASES = _PROBE_CONTACT_PHASES
+_ALLEGRO_POKE_PRESHAPE = np.asarray(
+    [
+        0.00, 0.80, 0.80, 0.50,
+        0.00, 0.10, 0.05, 0.05,
+        0.00, 0.10, 0.05, 0.05,
+        0.45, 0.10, 0.08, 0.08,
+    ],
+    dtype=float,
 )
 
 
@@ -61,6 +83,10 @@ class _Run:
     backend: ProbeBackend
     primitive: str
     target: int
+    mode: str = ""
+    protocol_id: str = PROBE_PROTOCOL_ID
+    feature_schema: str = FEATURE_SCHEMA_VERSION
+    sensor_profile_id: str = ""
     phase: str = "init"
     violations: List[str] = field(default_factory=list)
     quality: Dict[str, float] = field(default_factory=dict)
@@ -212,7 +238,25 @@ class _Run:
             self.fail("forbidden_penetration_limit")
 
         hand_target_contact = bool(hand.hand_contact_geoms)
-        if self.primitive in {"poke", "slide"}:
+        allegro_fingertip_poke = bool(
+            self.primitive == "poke" and self.backend.name == "allegro"
+        )
+        if allegro_fingertip_poke:
+            if probe.target_contact:
+                self.fail("probe_target_collision")
+            if hand_target_contact:
+                if self.phase not in _FINGERTIP_POKE_PHASES:
+                    self.fail("unexpected_hand_contact")
+                # MuJoCo can retain a zero-force contact row for one step while
+                # separating; in that case contact_geoms is populated but the
+                # force-thresholded hand_groups tuple is empty.
+                if set(hand.hand_groups) - {"ff"}:
+                    self.fail("inactive_finger_contact")
+                if set(hand.hand_contact_geoms) != {_FINGERTIP_POKE_GEOM}:
+                    self.fail("forbidden_hand_link_contact")
+            if hand.hand_max_penetration_m > self.target_penetration_limit_m:
+                self.fail("fingertip_penetration_limit")
+        elif self.primitive in {"poke", "slide"}:
             if hand_target_contact:
                 self.fail("hand_target_collision")
             if probe.target_contact and self.phase not in _PROBE_CONTACT_PHASES:
@@ -295,6 +339,10 @@ class _Run:
             target=self.target,
             primitive=self.primitive,
             scene_id=self.scene.task.scene_id,
+            protocol_id=self.protocol_id,
+            feature_schema=self.feature_schema,
+            mode=self.mode,
+            sensor_profile_id=self.sensor_profile_id,
             backend=self.backend.name,
             status=controller_status,
             valid=bool(valid),
@@ -304,7 +352,7 @@ class _Run:
             quality=dict(self.quality),
             features=features,
             contact_seconds=float(contact_seconds),
-            params=params,
+            params={"mode": self.mode, **params},
             raw_summary=raw_summary,
             trace=self.trace,
         )
@@ -325,6 +373,184 @@ def _mean_vec(
 
 def _ctrl(scene: AllegroProbeScene, actuator: str) -> float:
     return float(scene.data.ctrl[scene.act[actuator]])
+
+
+def _finite(name: str, value: float) -> float:
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _validate_lift_admission(
+    *,
+    lift_height: float,
+    target_object_lift: float,
+    lift_tolerance: float,
+    max_lift_speed: float,
+    support_loss_dwell: float,
+    lift_stable_dwell: float,
+    max_object_lift: float,
+    penetration_limit: float,
+    min_grasp_force: float,
+) -> None:
+    values = {
+        "lift_height": lift_height,
+        "target_object_lift": target_object_lift,
+        "lift_tolerance": lift_tolerance,
+        "max_lift_speed": max_lift_speed,
+        "support_loss_dwell": support_loss_dwell,
+        "lift_stable_dwell": lift_stable_dwell,
+        "max_object_lift": max_object_lift,
+        "penetration_limit": penetration_limit,
+        "min_grasp_force": min_grasp_force,
+    }
+    checked = {name: _finite(name, value) for name, value in values.items()}
+    if checked["lift_height"] <= 0.0:
+        raise ValueError("lift_height must be positive")
+    if checked["lift_height"] > 0.050:
+        raise ValueError("lift_height exceeds the 50 mm admission cap")
+    if checked["target_object_lift"] <= 0.0:
+        raise ValueError("target_object_lift must be positive")
+    if checked["target_object_lift"] > checked["lift_height"]:
+        raise ValueError("target_object_lift must not exceed lift_height")
+    if not 0.0 < checked["lift_tolerance"] < checked["target_object_lift"]:
+        raise ValueError("lift_tolerance must be in (0, target_object_lift)")
+    if not 0.005 <= checked["max_lift_speed"] <= 0.10:
+        raise ValueError("max_lift_speed must be in [0.005, 0.10] m/s")
+    if checked["lift_height"] / checked["max_lift_speed"] > 10.0:
+        raise ValueError("lift timeout exceeds the 10 s admission cap")
+    if checked["support_loss_dwell"] <= 0.0:
+        raise ValueError("support_loss_dwell must be positive")
+    if checked["support_loss_dwell"] > 2.0:
+        raise ValueError("support_loss_dwell exceeds 2 s")
+    if checked["lift_stable_dwell"] <= 0.0:
+        raise ValueError("lift_stable_dwell must be positive")
+    if checked["lift_stable_dwell"] > 2.0:
+        raise ValueError("lift_stable_dwell exceeds 2 s")
+    if (
+        checked["max_object_lift"]
+        < checked["target_object_lift"] + checked["lift_tolerance"]
+    ):
+        raise ValueError(
+            "max_object_lift must include the complete target tolerance band"
+        )
+    if checked["max_object_lift"] > 0.015:
+        raise ValueError("max_object_lift exceeds the 15 mm protocol cap")
+    if checked["penetration_limit"] <= 0.0:
+        raise ValueError("penetration_limit must be positive")
+    if checked["penetration_limit"] > 0.020:
+        raise ValueError("penetration_limit exceeds 20 mm")
+    if checked["min_grasp_force"] <= 0.0:
+        raise ValueError("min_grasp_force must be positive")
+
+
+def _validate_poke_admission(
+    *,
+    depth: float,
+    target_force: float,
+    force_limit: float,
+    contact_threshold: float,
+    lateral_ratio_limit: float,
+    hold_time: float,
+) -> None:
+    checked = {
+        name: _finite(name, value)
+        for name, value in {
+            "depth": depth,
+            "target_force": target_force,
+            "force_limit": force_limit,
+            "contact_threshold": contact_threshold,
+            "lateral_ratio_limit": lateral_ratio_limit,
+            "hold_time": hold_time,
+        }.items()
+    }
+    if checked["depth"] <= 0.0:
+        raise ValueError("depth must be positive")
+    if checked["depth"] > 0.020:
+        raise ValueError("depth exceeds 20 mm")
+    if checked["target_force"] <= 0.0:
+        raise ValueError("target_force must be positive")
+    if checked["force_limit"] < checked["target_force"]:
+        raise ValueError("force_limit must be at least target_force")
+    if checked["force_limit"] > 100.0:
+        raise ValueError("force_limit exceeds 100 N")
+    if checked["contact_threshold"] <= 0.0:
+        raise ValueError("contact_threshold must be positive")
+    if checked["lateral_ratio_limit"] <= 0.0:
+        raise ValueError("lateral_ratio_limit must be positive")
+    if checked["hold_time"] < 0.0:
+        raise ValueError("hold_time must be non-negative")
+    if checked["hold_time"] > 1.0:
+        raise ValueError("hold_time exceeds 1 s")
+
+
+def _rotation_distance_rad(first: np.ndarray, second: np.ndarray) -> float:
+    return float(
+        np.arccos(
+            np.clip(
+                (np.trace(np.asarray(first).T @ np.asarray(second)) - 1.0) / 2.0,
+                -1.0,
+                1.0,
+            )
+        )
+    )
+
+
+def _force_along_world_z(
+    scene: AllegroProbeScene, force_in_wrist_frame: np.ndarray
+) -> float:
+    from allegro_probe.geometry import quaternion_wxyz_to_matrix
+
+    world_force = quaternion_wxyz_to_matrix(scene.wrist_quat()) @ np.asarray(
+        force_in_wrist_frame, dtype=float
+    )
+    return float(world_force[2])
+
+
+def _object_axis_tilt_rad(scene: AllegroProbeScene, target: int) -> float:
+    """Return an axis-symmetric object's actual tilt from world vertical."""
+
+    from allegro_probe.geometry import quaternion_wxyz_to_matrix
+
+    rotation = quaternion_wxyz_to_matrix(scene.object_quat(target))
+    vertical_alignment = abs(float(rotation[2, 2]))
+    return float(np.arccos(np.clip(vertical_alignment, -1.0, 1.0)))
+
+
+def _lockin_coefficient(
+    values: np.ndarray, times: np.ndarray, frequency_Hz: float
+) -> complex:
+    signal = np.asarray(values, dtype=float)
+    time_values = np.asarray(times, dtype=float)
+    if signal.ndim != 1 or signal.size != time_values.size or signal.size < 4:
+        return 0.0j
+    centred = signal - float(np.mean(signal))
+    carrier = np.exp(-1j * 2.0 * np.pi * float(frequency_Hz) * time_values)
+    return complex(2.0 / signal.size * np.sum(centred * carrier))
+
+
+def _lockin_snr_db(
+    values: np.ndarray,
+    coefficient: complex,
+    times: np.ndarray,
+    frequency_Hz: float,
+) -> float:
+    signal = np.asarray(values, dtype=float)
+    time_values = np.asarray(times, dtype=float)
+    if signal.size < 4:
+        return float("-inf")
+    centred = signal - float(np.mean(signal))
+    fitted = np.real(
+        coefficient
+        * np.exp(1j * 2.0 * np.pi * float(frequency_Hz) * time_values)
+    )
+    residual = centred - fitted
+    ratio = float(
+        np.sum(fitted * fitted)
+        / max(float(np.sum(residual * residual)), 1e-12)
+    )
+    return float(10.0 * np.log10(max(ratio, 1e-12)))
 
 
 def _move_wrist(
@@ -431,16 +657,43 @@ def _contact_stable(
     require_support_free: bool,
     penetration_limit: float,
     quality_prefix: str,
+    lift_start_center_z: float | None = None,
+    target_object_lift: float | None = None,
+    lift_tolerance: float = 0.0,
+    max_wrist_z: float | None = None,
+    lift_correction_speed: float = 0.005,
+    grasp: _Grasp | None = None,
 ) -> Tuple[bool, ContactSnapshot, float]:
     scene = run.scene
     rel = []
+    rel_rotation = []
     valid_steps = 0
     last = ContactSnapshot()
     max_penetration = 0.0
     for _ in range(int(steps)):
+        if lift_start_center_z is not None and target_object_lift is not None:
+            actual_lift = float(
+                scene.object_center_pos(run.target)[2] - lift_start_center_z
+            )
+            if actual_lift < target_object_lift - lift_tolerance:
+                corrected_z = (
+                    _ctrl(scene, "act_wz") + lift_correction_speed * scene.dt
+                )
+                if max_wrist_z is not None:
+                    corrected_z = min(corrected_z, max_wrist_z)
+                scene.command(z=corrected_z)
         if not run.step(1):
             break
         last = scene.contact_snapshot(run.target)
+        if grasp is not None and grasp.top_entry:
+            grasp.close_alpha, safe = _regulate_top_pinch(
+                run,
+                grasp.close_alpha,
+                last,
+                target_force_N=grasp.target_force_N,
+            )
+            if not safe:
+                break
         max_penetration = max(max_penetration, last.max_penetration_m)
         opposing = _legal_grasp(run, last)
         support_ok = not require_support_free or (
@@ -449,7 +702,9 @@ def _contact_stable(
         penetration_ok = last.max_penetration_m <= penetration_limit
         if opposing and support_ok and penetration_ok:
             valid_steps += 1
-        rel.append(scene.relative_object_position(run.target).copy())
+        translation, rotation = scene.relative_object_pose_in_wrist(run.target)
+        rel.append(translation.copy())
+        rel_rotation.append(rotation.copy())
     rel_arr = np.asarray(rel, dtype=float)
     drift = (
         float(np.max(np.linalg.norm(rel_arr - rel_arr[0], axis=1)))
@@ -457,6 +712,15 @@ def _contact_stable(
         else float("inf")
     )
     run.quality[f"{quality_prefix}_relative_drift_m"] = drift
+    if rel_rotation:
+        initial_rotation = rel_rotation[0]
+        rotation_drift = max(
+            _rotation_distance_rad(initial_rotation, rotation)
+            for rotation in rel_rotation
+        )
+    else:
+        rotation_drift = float("inf")
+    run.quality[f"{quality_prefix}_relative_rotation_drift_rad"] = rotation_drift
     run.quality[f"{quality_prefix}_max_penetration_m"] = max_penetration
     run.quality[f"{quality_prefix}_stable_fraction"] = valid_steps / max(
         int(steps), 1
@@ -809,21 +1073,72 @@ def _lift_and_gate(
     grasp: _Grasp,
     *,
     lift_height: float,
+    target_object_lift: float,
+    lift_tolerance: float,
+    max_lift_speed: float,
+    support_loss_dwell: float,
+    lift_stable_dwell: float,
+    max_object_lift: float,
     penetration_limit: float,
 ) -> Tuple[bool, ContactSnapshot]:
     scene = run.scene
     if not grasp.established:
         run.enter("post_check")
         return False, scene.contact_snapshot(run.target)
+    if lift_height <= 0.0:
+        raise ValueError("lift_height must be positive")
+    if target_object_lift <= 0.0 or target_object_lift > lift_height:
+        raise ValueError("target_object_lift must be in (0, lift_height]")
+    if lift_tolerance <= 0.0 or lift_tolerance >= target_object_lift:
+        raise ValueError("lift_tolerance must be in (0, target_object_lift)")
+    if max_lift_speed <= 0.0:
+        raise ValueError("max_lift_speed must be positive")
+    if support_loss_dwell <= 0.0:
+        raise ValueError("support_loss_dwell must be positive")
+    if lift_stable_dwell <= 0.0:
+        raise ValueError("lift_stable_dwell must be positive")
+    if max_object_lift < target_object_lift + lift_tolerance:
+        raise ValueError(
+            "max_object_lift must include the complete target tolerance band"
+        )
+
     run.enter("lift")
     z0 = _ctrl(scene, "act_wz")
-    steps = 700 if grasp.top_entry else 220
+    z_command = z0
+    lift_start_center_z = float(scene.object_center_pos(run.target)[2])
+    lift_start_lowest_exterior_z = scene.object_lowest_exterior_z(run.target)
+    lift_source_support_z = scene.object_source_support_z(run.target)
+    max_steps = max(
+        1,
+        int(np.ceil(lift_height / (max_lift_speed * scene.dt))) + 120,
+    )
+    support_loss_steps_required = max(
+        1, int(np.ceil(support_loss_dwell / scene.dt))
+    )
+    target_stable_steps_required = max(
+        1, int(np.ceil(lift_stable_dwell / scene.dt))
+    )
     lost_steps = 0
+    support_free_steps = 0
+    target_stable_steps = 0
+    ever_support_free = False
+    reached_target_band = False
+    wrist_limit_steps = 0
     progress = grasp.close_alpha
-    for index in range(steps):
-        u = (index + 1) / steps
-        alpha = u * u * (3.0 - 2.0 * u)
-        scene.command(z=z0 + alpha * lift_height)
+    snapshot = scene.contact_snapshot(run.target)
+    for _ in range(max_steps):
+        object_lift = float(
+            scene.object_center_pos(run.target)[2] - lift_start_center_z
+        )
+        if object_lift > max_object_lift:
+            run.fail("object_lift_limit")
+            break
+        if object_lift < target_object_lift - lift_tolerance:
+            z_command = min(
+                z_command + max_lift_speed * scene.dt,
+                z0 + lift_height,
+            )
+        scene.command(z=z_command)
         if not run.step(1):
             break
         snapshot = scene.contact_snapshot(run.target)
@@ -843,6 +1158,42 @@ def _lift_and_gate(
         if lost_steps > 80:
             run.fail("lost_grasp_during_lift")
             break
+        support_free = not snapshot.support_contact and not snapshot.table_contact
+        if support_free:
+            support_free_steps += 1
+            ever_support_free = True
+        else:
+            support_free_steps = 0
+        object_lift = float(
+            scene.object_center_pos(run.target)[2] - lift_start_center_z
+        )
+        in_target_band = bool(
+            target_object_lift - lift_tolerance
+            <= object_lift
+            <= target_object_lift + lift_tolerance
+        )
+        if in_target_band and support_free_steps >= support_loss_steps_required:
+            target_stable_steps += 1
+            reached_target_band = True
+        else:
+            target_stable_steps = 0
+        run.sample(
+            object_lift_m=object_lift,
+            wrist_lift_command_m=z_command - z0,
+            support_free=float(support_free),
+        )
+        if target_stable_steps >= target_stable_steps_required:
+            break
+        if (
+            z_command >= z0 + lift_height - 1e-9
+            and object_lift < target_object_lift - lift_tolerance
+        ):
+            wrist_limit_steps += 1
+        else:
+            wrist_limit_steps = 0
+        if wrist_limit_steps > 100:
+            run.fail("object_lift_target_not_reached")
+            break
     grasp.close_alpha = progress
 
     run.enter("post_check")
@@ -852,28 +1203,64 @@ def _lift_and_gate(
         require_support_free=True,
         penetration_limit=penetration_limit,
         quality_prefix="postlift",
+        lift_start_center_z=lift_start_center_z,
+        target_object_lift=target_object_lift,
+        lift_tolerance=lift_tolerance,
+        max_wrist_z=z0 + lift_height,
+        lift_correction_speed=max_lift_speed,
+        grasp=grasp,
     )
     lifted_distance = float(
-        scene.object_pos(run.target)[2] - grasp.initial_object_pos[2]
+        scene.object_center_pos(run.target)[2] - lift_start_center_z
     )
     run.quality["lift_distance_m"] = lifted_distance
+    run.quality["lift_start_center_z_m"] = lift_start_center_z
+    run.quality["lift_start_lowest_exterior_z_m"] = (
+        lift_start_lowest_exterior_z
+    )
+    run.quality["lift_source_support_z_m"] = lift_source_support_z
+    run.quality["target_object_lift_m"] = float(target_object_lift)
+    run.quality["lift_target_error_m"] = float(
+        lifted_distance - target_object_lift
+    )
+    run.quality["wrist_lift_command_m"] = float(
+        _ctrl(scene, "act_wz") - z0
+    )
+    run.quality["support_free_dwell_s"] = float(
+        support_free_steps * scene.dt
+    )
+    run.quality["lift_target_stable_dwell_s"] = float(
+        target_stable_steps * scene.dt
+    )
+    run.quality["ever_support_free"] = float(ever_support_free)
+    run.quality["lift_started"] = float(z_command > z0 + 1e-6)
     run.quality["support_contact_after_lift"] = float(snapshot.support_contact)
     run.quality["table_contact_after_lift"] = float(snapshot.table_contact)
     run.quality["postlift_group_count"] = float(len(snapshot.hand_groups))
 
     valid = grasp.established and stable and not run.violations
-    if lifted_distance < min(0.010, 0.5 * lift_height):
+    if not reached_target_band or not (
+        target_object_lift - lift_tolerance
+        <= lifted_distance
+        <= target_object_lift + lift_tolerance
+    ):
         valid = False
-        run.fail("not_lifted")
+        run.fail("object_lift_target_not_stable")
+    if support_free_steps < support_loss_steps_required:
+        valid = False
+        run.fail("support_loss_dwell_not_met")
     if snapshot.support_contact or snapshot.table_contact:
         valid = False
         run.fail("support_contact_after_lift")
     if not _legal_grasp(run, snapshot):
         valid = False
         run.fail("lost_grasp")
-    if drift > 0.008:
+    if drift > 0.0035:
         valid = False
         run.fail("postlift_slip")
+    if run.quality.get("postlift_relative_rotation_drift_rad", 0.0) > np.deg2rad(5.0):
+        valid = False
+        run.fail("postlift_rotation_slip")
     return valid, snapshot
 
 
@@ -1062,30 +1449,426 @@ def _place_and_retreat(run: _Run, grasp: _Grasp, *, object_lifted: bool) -> bool
     )
 
 
+def _legal_fingertip_poke_contact(snapshot: ContactSnapshot) -> bool:
+    return bool(
+        set(snapshot.hand_groups) == {"ff"}
+        and set(snapshot.hand_contact_geoms) == {_FINGERTIP_POKE_GEOM}
+        and not snapshot.palm_object_contact
+    )
+
+
+def _safe_fingertip_retreat(run: _Run) -> bool:
+    """Retract vertically before rotating or opening the downward-facing hand."""
+
+    scene = run.scene
+    run.enter("retreat")
+    z_clear = min(_ctrl(scene, "act_wz") + 0.060, 0.12)
+    moved = _move_wrist(
+        run,
+        steps=300,
+        z=z_clear,
+        roll=float(np.pi),
+        tilt=0.0,
+        yaw=0.0,
+        probe=0.0,
+    )
+    if moved and z_clear < 0.119:
+        moved = _move_wrist(
+            run,
+            steps=220,
+            z=0.12,
+            roll=float(np.pi),
+            tilt=0.0,
+            yaw=0.0,
+            probe=0.0,
+        )
+    clear = bool(
+        scene.fingertip_touch("ff") <= 1e-4
+        and not scene.contact_snapshot(run.target).hand_groups
+    )
+    if not clear:
+        run.fail("fingertip_not_clear_after_retreat")
+    if moved and clear:
+        moved = _move_wrist(
+            run,
+            steps=300,
+            roll=0.0,
+            tilt=0.0,
+            yaw=0.0,
+        )
+    if moved:
+        moved = _move_allegro_hand(run, scene.allegro_grip_pose(0.0), 120)
+    run.enter("post_retreat_check")
+    settled = run.step(20)
+    return bool(moved and clear and settled)
+
+
+def _poke_with_allegro_fingertip(
+    run: _Run,
+    *,
+    depth: float,
+    target_force: float,
+    force_limit: float,
+    contact_threshold: float,
+    lateral_ratio_limit: float,
+    hold_time: float,
+) -> ProbeResult:
+    """Execute a guarded index-fingertip indentation using real touch feedback."""
+
+    scene = run.scene
+    run.sensor_profile_id = "sim.allegro_ff_tip_touch+wrist_ft.v1"
+    run.target_penetration_limit_m = 0.0005
+    target_top = scene.object_pos(run.target).copy()
+
+    run.enter("approach")
+    if not scene.full_hand_collisions_compiled():
+        run.fail("full_hand_collisions_required")
+    if not run.violations:
+        _move_allegro_hand(run, _ALLEGRO_POKE_PRESHAPE, 160)
+    if not run.violations:
+        _move_wrist(
+            run,
+            steps=220,
+            x=float(target_top[0]),
+            y=float(target_top[1]),
+            z=0.12,
+            probe=0.0,
+        )
+    if not run.violations:
+        _move_wrist(
+            run,
+            steps=300,
+            roll=float(np.pi),
+            tilt=0.0,
+            yaw=0.0,
+        )
+
+    # Calibrate the wrist target from the live site pose.  This remains valid if
+    # the Menagerie kinematics or preshape changes; no fingertip offset is baked in.
+    desired_tip = target_top.copy()
+    desired_tip[2] += 0.040
+    for _ in range(2):
+        if run.violations:
+            break
+        tip = scene.fingertip_positions()["ff"]
+        _move_wrist(
+            run,
+            steps=260,
+            x=_ctrl(scene, "act_wx") + float(desired_tip[0] - tip[0]),
+            y=_ctrl(scene, "act_wy") + float(desired_tip[1] - tip[1]),
+            z=_ctrl(scene, "act_wz") + float(desired_tip[2] - tip[2]),
+            roll=float(np.pi),
+            tilt=0.0,
+            yaw=0.0,
+            probe=0.0,
+        )
+    force_baseline = (
+        _mean_vec(run, scene.wrist_force_vec, 40)
+        if not run.violations
+        else np.zeros(3, dtype=float)
+    )
+
+    run.enter("guarded_contact")
+    contact_z = None
+    object_z = None
+    z_command = _ctrl(scene, "act_wz")
+    max_guard_steps = max(1, int(np.ceil((0.050 + depth) / 0.00015)))
+    for _ in range(max_guard_steps if not run.violations else 0):
+        z_command -= 0.00015
+        scene.command(z=z_command)
+        if not run.step(3):
+            break
+        touch = scene.fingertip_touch("ff")
+        snapshot = scene.contact_snapshot(run.target)
+        if touch > force_limit:
+            run.fail("force_limit")
+            break
+        if touch >= contact_threshold and _legal_fingertip_poke_contact(snapshot):
+            contact_z = float(scene.fingertip_positions()["ff"][2])
+            object_z = float(scene.object_pos(run.target)[2])
+            break
+    if contact_z is None and not run.violations:
+        run.fail("no_contact")
+
+    run.enter("contact_quality_gate")
+    stable_identity_steps = 0
+    if contact_z is not None:
+        for _ in range(20):
+            if not run.step(1):
+                break
+            snapshot = scene.contact_snapshot(run.target)
+            if _legal_fingertip_poke_contact(snapshot):
+                stable_identity_steps += 1
+            else:
+                stable_identity_steps = 0
+    run.quality["contact_identity_stable_fraction"] = stable_identity_steps / 20.0
+    if contact_z is not None and stable_identity_steps < 16:
+        run.fail("unstable_target_contact")
+
+    loading_trace: List[Tuple[float, float, float, float]] = []
+    hold_force: List[float] = []
+    contact_steps = 0
+    if contact_z is not None and not run.violations:
+        run.enter("primitive_execution")
+        integral = 0.0
+        force_stable_steps = 0
+        touch_lost_steps = 0
+        for _ in range(max(80, int(0.8 / scene.dt))):
+            touch = scene.fingertip_touch("ff")
+            error = target_force - touch
+            integral = float(
+                np.clip(integral + error * scene.dt, -0.2, 0.2)
+            )
+            dz = float(
+                np.clip(2.5e-5 * error + 4.0e-6 * integral, -1.5e-5, 2.5e-5)
+            )
+            z_command -= dz
+            scene.command(z=z_command)
+            if not run.step(1):
+                break
+            tip_z = float(scene.fingertip_positions()["ff"][2])
+            indentation = max(contact_z - tip_z, 0.0)
+            compression = max(
+                float(object_z) - float(scene.object_pos(run.target)[2]), 0.0
+            )
+            touch = scene.fingertip_touch("ff")
+            fvec = scene.wrist_force_vec() - force_baseline
+            ft = float(np.linalg.norm(fvec[:2]))
+            loading_trace.append((indentation, compression, touch, ft))
+            run.sample(
+                effector="ff_tip",
+                force_N=touch,
+                touch_force_N=touch,
+                wrist_force_delta_N=fvec,
+                indentation_m=indentation,
+                compression_m=compression,
+                compression_joint_q=float(
+                    scene.data.qpos[
+                        scene.joint_qadr[f"obj{run.target}_compress"]
+                    ]
+                ),
+                lateral_force_N=ft,
+            )
+            if touch > force_limit:
+                run.fail("force_limit")
+                break
+            snapshot = scene.contact_snapshot(run.target)
+            if not _legal_fingertip_poke_contact(snapshot):
+                touch_lost_steps += 1
+            else:
+                touch_lost_steps = 0
+            if touch_lost_steps > 20:
+                run.fail("lost_contact")
+                break
+            if (
+                touch > 0.5 * target_force
+                and ft / max(touch, 1e-6) > lateral_ratio_limit
+            ):
+                run.fail("excess_lateral_force")
+                break
+            contact_steps += 1
+            if abs(touch - target_force) <= 0.08 * target_force:
+                force_stable_steps += 1
+            else:
+                force_stable_steps = 0
+            if compression >= depth or force_stable_steps >= 30:
+                break
+
+        # This spring-damper object has no independent viscoelastic ground truth.
+        # The hold ratio is retained as controller diagnostics, not labelled as
+        # material relaxation.
+        n_hold = max(0, int(hold_time / scene.dt))
+        for _ in range(n_hold):
+            touch = scene.fingertip_touch("ff")
+            error = target_force - touch
+            integral = float(
+                np.clip(integral + error * scene.dt, -0.2, 0.2)
+            )
+            dz = float(
+                np.clip(2.5e-5 * error + 4.0e-6 * integral, -1.5e-5, 2.5e-5)
+            )
+            z_command -= dz
+            scene.command(z=z_command)
+            if not run.step(1):
+                break
+            touch = scene.fingertip_touch("ff")
+            hold_force.append(touch)
+            contact_steps += 1
+            run.sample(hold_force_N=touch)
+            if touch > force_limit:
+                run.fail("force_limit")
+                break
+            if not _legal_fingertip_poke_contact(
+                scene.contact_snapshot(run.target)
+            ):
+                run.fail("lost_contact_during_hold")
+                break
+
+    run.enter("post_check")
+    if len(loading_trace) >= 3:
+        probe_x = np.asarray([p[0] for p in loading_trace])
+        comp_x = np.asarray([p[1] for p in loading_trace])
+        force = np.asarray([p[2] for p in loading_trace])
+        x_fit = comp_x if np.ptp(comp_x) > 1e-5 else probe_x
+        mask = (x_fit > 5e-5) & (force > contact_threshold)
+        if mask.sum() >= 2 and np.ptp(x_fit[mask]) > 1e-5:
+            k_est = float(np.polyfit(x_fit[mask], force[mask], 1)[0])
+        else:
+            k_est = 0.0
+        peak = float(force.max())
+        indentation_max = float(probe_x.max())
+        compression_max = float(comp_x.max())
+    else:
+        k_est = peak = indentation_max = compression_max = 0.0
+    effective = compression_max if compression_max > 1e-5 else indentation_max
+    if k_est <= 0.0 and effective > 1e-6 and peak > 1e-6:
+        k_est = peak / effective
+    compliance = effective / peak * 1000.0 if peak > 1e-6 else 0.0
+    path_fraction = min(effective / max(depth, 1e-9), 1.0)
+    hold_ratio = 0.0
+    if hold_force:
+        window = max(1, min(len(hold_force) // 4, 25))
+        hold_ratio = float(
+            np.mean(hold_force[-window:])
+            / max(float(np.mean(hold_force[:window])), 1e-9)
+        )
+    run.quality["path_completion_ratio"] = path_fraction
+    run.quality["peak_force_N"] = peak
+    run.quality["target_force_ratio"] = peak / max(target_force, 1e-9)
+    run.quality["hold_force_ratio"] = hold_ratio
+    if peak < 0.80 * target_force and path_fraction < 0.80:
+        run.fail("target_force_not_reached")
+    if len(loading_trace) < 3:
+        run.fail("insufficient_samples")
+    valid = not run.violations
+
+    retreat_ok = _safe_fingertip_retreat(run)
+    valid = valid and retreat_ok and not run.violations
+    run.phase = "complete" if valid else "retreat"
+    return run.result(
+        features={
+            "k_est_N_per_m": max(k_est, 0.0) if valid else 0.0,
+            "k_est_N_per_mm": max(k_est / 1000.0, 0.0) if valid else 0.0,
+            "compliance_mm_per_N": max(compliance, 0.0) if valid else 0.0,
+            "peak_force_N": peak,
+            "indentation_mm": indentation_max * 1000.0,
+            "compression_mm": compression_max * 1000.0,
+            "hold_force_ratio": hold_ratio,
+        },
+        contact_seconds=contact_steps * scene.dt,
+        params={
+            "depth": depth,
+            "target_force": target_force,
+            "force_limit": force_limit,
+            "hold_time": hold_time,
+            "effector": "ff_tip",
+            "sensor": "ff_tip_touch",
+        },
+        raw_summary={
+            "n_loading_samples": len(loading_trace),
+            "n_hold_samples": len(hold_force),
+            "contact_z": contact_z,
+            "force_baseline": force_baseline,
+            "contact_geom_whitelist": [_FINGERTIP_POKE_GEOM],
+        },
+        valid=valid,
+    )
+
+
 def poke(
     executor: ProbeBackend | AllegroProbeScene,
     target: int,
-    depth: float = 0.006,
-    target_force: float = 3.0,
-    force_limit: float = 10.0,
+    depth: float | None = None,
+    target_force: float | None = None,
+    force_limit: float | None = None,
     contact_threshold: float = 0.05,
     lateral_ratio_limit: float = 0.35,
+    *,
+    hold_time: float | None = None,
+    mode: str | None = None,
+    protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
-    run = _Run(backend, "poke", int(target))
+    run = _Run(
+        backend,
+        "poke",
+        int(target),
+        mode=canonical_probe_mode("poke", mode),
+        protocol_id=validate_protocol_id(protocol_id),
+    )
+    if backend.name == "allegro":
+        resolved_depth = float(
+            V1_DEFAULTS.allegro_poke_max_depth_m if depth is None else depth
+        )
+        resolved_target_force = float(
+            V1_DEFAULTS.allegro_poke_target_force_N
+            if target_force is None
+            else target_force
+        )
+        resolved_force_limit = float(
+            V1_DEFAULTS.allegro_poke_force_limit_N
+            if force_limit is None
+            else force_limit
+        )
+        resolved_hold_time = float(
+            V1_DEFAULTS.allegro_poke_hold_s
+            if hold_time is None
+            else hold_time
+        )
+        _validate_poke_admission(
+            depth=resolved_depth,
+            target_force=resolved_target_force,
+            force_limit=resolved_force_limit,
+            contact_threshold=contact_threshold,
+            lateral_ratio_limit=lateral_ratio_limit,
+            hold_time=resolved_hold_time,
+        )
+        return _poke_with_allegro_fingertip(
+            run,
+            depth=resolved_depth,
+            target_force=resolved_target_force,
+            force_limit=resolved_force_limit,
+            contact_threshold=float(contact_threshold),
+            lateral_ratio_limit=float(lateral_ratio_limit),
+            hold_time=resolved_hold_time,
+        )
+
+    depth = float(V1_DEFAULTS.poke_max_depth_m if depth is None else depth)
+    target_force = float(
+        V1_DEFAULTS.poke_target_force_N if target_force is None else target_force
+    )
+    force_limit = float(
+        V1_DEFAULTS.poke_force_limit_N if force_limit is None else force_limit
+    )
+    hold_time = float(0.0 if hold_time is None else hold_time)
+    _validate_poke_admission(
+        depth=depth,
+        target_force=target_force,
+        force_limit=force_limit,
+        contact_threshold=contact_threshold,
+        lateral_ratio_limit=lateral_ratio_limit,
+        hold_time=hold_time,
+    )
+    run.sensor_profile_id = "sim.central_probe_touch+probe_ft.v1"
     run.target_penetration_limit_m = 0.001
     scene = run.scene
     x = scene.candidate_x(run.target)
 
     run.enter("approach")
-    _probe_above(run, x=x, clearance=0.030)
-    force_baseline = _mean_vec(run, scene.probe_force_vec, 40)
+    approached = _probe_above(run, x=x, clearance=0.030)
+    force_baseline = (
+        _mean_vec(run, scene.probe_force_vec, 40)
+        if approached and not run.violations
+        else np.zeros(3, dtype=float)
+    )
 
     run.enter("guarded_contact")
     contact_z = None
     object_z = None
     extension = 0.0
-    for extension in np.linspace(0.0, 0.17, 120):
+    for extension in (
+        np.linspace(0.0, 0.17, 120) if not run.violations else ()
+    ):
         scene.command(probe=float(extension))
         if not run.step(4):
             break
@@ -1231,6 +2014,9 @@ def poke(
             "depth": depth,
             "target_force": target_force,
             "force_limit": force_limit,
+            "hold_time": hold_time,
+            "effector": "central_probe",
+            "sensor": "probe_touch",
         },
         raw_summary={
             "n_samples": len(trace),
@@ -1245,26 +2031,65 @@ def heft(
     executor: ProbeBackend | AllegroProbeScene,
     target: int,
     lift_height: float | None = None,
-    hold_time: float = 0.45,
-    osc_amp: float = 0.001,
+    hold_time: float = V1_DEFAULTS.heft_hold_s,
+    osc_amp: float = 0.0,
     osc_freq: float = 1.5,
     penetration_limit: float = 0.0055,
     min_grasp_force: float | None = None,
+    *,
+    target_object_lift: float = V1_DEFAULTS.micro_lift_target_m,
+    lift_tolerance: float = V1_DEFAULTS.micro_lift_tolerance_m,
+    max_lift_speed: float = V1_DEFAULTS.micro_lift_speed_m_per_s,
+    support_loss_dwell: float = V1_DEFAULTS.support_loss_dwell_s,
+    lift_stable_dwell: float = V1_DEFAULTS.micro_lift_stable_dwell_s,
+    max_object_lift: float = V1_DEFAULTS.max_object_lift_m,
+    mode: str | None = None,
+    protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
-    run = _Run(backend, "heft", int(target))
+    run = _Run(
+        backend,
+        "heft",
+        int(target),
+        mode=canonical_probe_mode("heft", mode),
+        protocol_id=validate_protocol_id(protocol_id),
+    )
+    run.sensor_profile_id = "sim.wrist_ft+collision_contact.v1"
     run.target_penetration_limit_m = float(penetration_limit)
     scene = run.scene
     commanded_lift = float(
         lift_height
         if lift_height is not None
-        else (0.130 if backend.name == "allegro" else 0.025)
+        else V1_DEFAULTS.micro_lift_max_wrist_travel_m
     )
     required_force = (
         float(min_grasp_force)
         if min_grasp_force is not None
         else (7.0 if backend.name == "allegro" else 3.0)
     )
+    hold_time = _finite("hold_time", hold_time)
+    if hold_time <= 0.0:
+        raise ValueError("hold_time must be positive")
+    if hold_time > 1.0:
+        raise ValueError("hold_time exceeds the 1 s protocol cap")
+    if _finite("osc_amp", osc_amp) != 0.0:
+        raise ValueError(
+            "unsupported_micro_lift is a static protocol; osc_amp must be zero"
+        )
+    if _finite("osc_freq", osc_freq) <= 0.0:
+        raise ValueError("osc_freq must be positive")
+    _validate_lift_admission(
+        lift_height=commanded_lift,
+        target_object_lift=target_object_lift,
+        lift_tolerance=lift_tolerance,
+        max_lift_speed=max_lift_speed,
+        support_loss_dwell=support_loss_dwell,
+        lift_stable_dwell=lift_stable_dwell,
+        max_object_lift=max_object_lift,
+        penetration_limit=penetration_limit,
+        min_grasp_force=required_force,
+    )
+    measurement_steps = max(1, int(hold_time / scene.dt))
     grasp = _prepare_grasp(
         run,
         penetration_limit=penetration_limit,
@@ -1274,21 +2099,51 @@ def heft(
         run,
         grasp,
         lift_height=commanded_lift,
+        target_object_lift=float(target_object_lift),
+        lift_tolerance=float(lift_tolerance),
+        max_lift_speed=float(max_lift_speed),
+        support_loss_dwell=float(support_loss_dwell),
+        lift_stable_dwell=float(lift_stable_dwell),
+        max_object_lift=float(max_object_lift),
         penetration_limit=penetration_limit,
     )
 
     force_trace = []
+    gravity_force_trace = []
+    measurement_min_lift = float(run.quality.get("lift_distance_m", 0.0))
+    measurement_max_lift = measurement_min_lift
     if valid:
         run.enter("measurement")
         z0 = _ctrl(scene, "act_wz")
-        n = max(1, int(hold_time / scene.dt))
+        z_hold = z0
+        n = measurement_steps
         invalid_contact_steps = 0
+        low_height_steps = 0
+        high_height_steps = 0
         for k in range(n):
-            t = k * scene.dt
-            scene.command(z=z0 + osc_amp * np.sin(2 * np.pi * osc_freq * t))
+            actual_lift = float(
+                scene.object_center_pos(run.target)[2]
+                - run.quality["lift_start_center_z_m"]
+            )
+            if actual_lift < target_object_lift - lift_tolerance:
+                z_hold = min(
+                    z_hold + 0.005 * scene.dt,
+                    z0 + 0.003,
+                )
+            # unsupported_micro_lift is deliberately static. Do not even
+            # evaluate the deprecated oscillation expression: 0*sin(inf) is
+            # NaN and could otherwise poison MuJoCo control for an extreme but
+            # finite legacy osc_freq value.
+            scene.command(z=z_hold)
             if not run.step(1):
                 valid = False
                 break
+            actual_lift = float(
+                scene.object_center_pos(run.target)[2]
+                - run.quality["lift_start_center_z_m"]
+            )
+            measurement_min_lift = min(measurement_min_lift, actual_lift)
+            measurement_max_lift = max(measurement_max_lift, actual_lift)
             current = scene.contact_snapshot(run.target)
             if grasp.top_entry:
                 grasp.close_alpha, safe = _regulate_top_pinch(
@@ -1302,7 +2157,33 @@ def heft(
                     break
             sample = scene.wrist_force_vec() - grasp.baseline_force
             force_trace.append(sample.copy())
-            run.sample(wrist_force_delta_N=sample)
+            gravity_sample = _force_along_world_z(scene, sample)
+            gravity_force_trace.append(gravity_sample)
+            run.sample(
+                wrist_force_delta_N=sample,
+                gravity_axis_force_delta_N=gravity_sample,
+                object_lift_m=actual_lift,
+            )
+            if actual_lift > max_object_lift:
+                valid = False
+                run.fail("object_lift_limit_during_measurement")
+                break
+            if actual_lift < target_object_lift - lift_tolerance:
+                low_height_steps += 1
+            else:
+                low_height_steps = 0
+            if actual_lift > target_object_lift + lift_tolerance:
+                high_height_steps += 1
+            else:
+                high_height_steps = 0
+            if low_height_steps > 20:
+                valid = False
+                run.fail("object_lift_below_measurement_band")
+                break
+            if high_height_steps > 20:
+                valid = False
+                run.fail("object_lift_above_measurement_band")
+                break
             if current.support_contact or current.table_contact:
                 valid = False
                 run.fail("support_contact_during_measurement")
@@ -1315,17 +2196,19 @@ def heft(
                 valid = False
                 run.fail("grasp_lost_during_measurement")
                 break
+    run.quality["measurement_min_object_lift_m"] = measurement_min_lift
+    run.quality["measurement_max_object_lift_m"] = measurement_max_lift
     if force_trace:
-        force_arr = np.asarray(force_trace)
-        # Sensor sign depends on the welded child convention, so use the stable
-        # gravity-axis magnitude after baseline subtraction.
-        weight_signal = float(abs(np.median(force_arr[:, 2]))) if valid else 0.0
-        force_std = float(np.std(force_arr[:, 2]))
+        gravity_arr = np.asarray(gravity_force_trace)
+        weight_signal = float(abs(np.median(gravity_arr))) if valid else 0.0
+        force_std = float(np.std(gravity_arr))
     else:
         weight_signal = force_std = 0.0
     m_est = weight_signal / 9.81
 
-    object_lifted = run.quality.get("lift_distance_m", 0.0) >= 0.010
+    object_lifted = bool(
+        grasp.established and run.quality.get("lift_started", 0.0) > 0.5
+    )
     cleanup_ok = _place_and_retreat(run, grasp, object_lifted=object_lifted)
     valid = valid and cleanup_ok and not run.violations
     run.phase = "complete" if valid else "retreat"
@@ -1341,8 +2224,15 @@ def heft(
         contact_seconds=len(force_trace) * scene.dt,
         params={
             "lift_height": commanded_lift,
+            "target_object_lift": target_object_lift,
+            "lift_tolerance": lift_tolerance,
+            "max_lift_speed": max_lift_speed,
+            "support_loss_dwell": support_loss_dwell,
+            "lift_stable_dwell": lift_stable_dwell,
+            "max_object_lift": max_object_lift,
             "hold_time": hold_time,
             "osc_amp": osc_amp,
+            "osc_freq": osc_freq,
             "penetration_limit": penetration_limit,
         },
         raw_summary={
@@ -1358,27 +2248,178 @@ def shake(
     executor: ProbeBackend | AllegroProbeScene,
     target: int,
     lift_height: float | None = None,
-    tilt_amp: float = 0.07,
-    yaw_amp: float = 0.06,
-    freq: float = 1.2,
-    duration: float = 0.8,
+    tilt_amp: float = V1_DEFAULTS.shake_tilt_amplitude_rad,
+    yaw_amp: float = V1_DEFAULTS.shake_yaw_amplitude_rad,
+    freq: float = V1_DEFAULTS.shake_frequency_Hz,
+    duration: float = V1_DEFAULTS.shake_duration_s,
     penetration_limit: float = 0.0055,
     min_grasp_force: float | None = None,
+    *,
+    dynamic_baseline_time: float = 0.200,
+    ramp_cycles: float = 0.25,
+    analysis_cycles: int | None = None,
+    post_zero_hold_time: float = 0.120,
+    max_dynamic_translation_drift: float = 0.005,
+    max_dynamic_rotation_drift: float = float(np.deg2rad(6.1)),
+    minimum_bottom_clearance: float = (
+        V1_DEFAULTS.shake_min_bottom_clearance_m
+    ),
+    target_object_lift: float | None = None,
+    lift_tolerance: float = V1_DEFAULTS.micro_lift_tolerance_m,
+    max_lift_speed: float = V1_DEFAULTS.micro_lift_speed_m_per_s,
+    support_loss_dwell: float = V1_DEFAULTS.support_loss_dwell_s,
+    lift_stable_dwell: float = V1_DEFAULTS.shake_lift_stable_dwell_s,
+    max_object_lift: float = V1_DEFAULTS.max_object_lift_m,
+    mode: str | None = None,
+    protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
-    run = _Run(backend, "shake", int(target))
+    run = _Run(
+        backend,
+        "shake",
+        int(target),
+        mode=canonical_probe_mode("shake", mode),
+        protocol_id=validate_protocol_id(protocol_id),
+    )
+    run.sensor_profile_id = "sim.wrist_ft+collision_contact.v1"
     run.target_penetration_limit_m = float(penetration_limit)
     scene = run.scene
+    freq = _finite("freq", freq)
+    duration = _finite("duration", duration)
+    tilt_amp = _finite("tilt_amp", tilt_amp)
+    yaw_amp = _finite("yaw_amp", yaw_amp)
+    ramp_cycles = _finite("ramp_cycles", ramp_cycles)
+    dynamic_baseline_time = _finite(
+        "dynamic_baseline_time", dynamic_baseline_time
+    )
+    post_zero_hold_time = _finite(
+        "post_zero_hold_time", post_zero_hold_time
+    )
+    max_dynamic_translation_drift = _finite(
+        "max_dynamic_translation_drift", max_dynamic_translation_drift
+    )
+    max_dynamic_rotation_drift = _finite(
+        "max_dynamic_rotation_drift", max_dynamic_rotation_drift
+    )
+    minimum_bottom_clearance = _finite(
+        "minimum_bottom_clearance", minimum_bottom_clearance
+    )
+    if not 0.5 <= freq <= 5.0:
+        raise ValueError("freq must be in [0.5, 5.0] Hz")
+    if not 0.1 <= duration <= 2.0:
+        raise ValueError("duration must be in [0.1, 2.0] s")
+    if not 0.0 <= ramp_cycles <= 1.0:
+        raise ValueError("ramp_cycles must be in [0, 1]")
+    if dynamic_baseline_time <= 0.0 or post_zero_hold_time <= 0.0:
+        raise ValueError("baseline and post-zero hold times must be positive")
+    if dynamic_baseline_time > 1.0 or post_zero_hold_time > 1.0:
+        raise ValueError("baseline and post-zero hold times must not exceed 1 s")
+    if (
+        max_dynamic_translation_drift <= 0.0
+        or max_dynamic_rotation_drift <= 0.0
+    ):
+        raise ValueError("dynamic drift limits must be positive")
+    if max_dynamic_translation_drift > 0.020:
+        raise ValueError("dynamic translation drift limit exceeds 20 mm")
+    if max_dynamic_rotation_drift > np.deg2rad(30.0):
+        raise ValueError("dynamic rotation drift limit exceeds 30 degrees")
+    if not (
+        V1_DEFAULTS.shake_min_bottom_clearance_m
+        <= minimum_bottom_clearance
+        <= 0.010
+    ):
+        raise ValueError(
+            "minimum_bottom_clearance must be in [1.5, 10] mm"
+        )
+    if analysis_cycles is not None and (
+        not isinstance(analysis_cycles, (int, np.integer))
+        or int(analysis_cycles) <= 0
+    ):
+        raise ValueError("analysis_cycles must be a positive integer")
+    if abs(tilt_amp) <= 1e-9:
+        raise ValueError("unsupported_micro_shake requires non-zero tilt_amp")
+    if abs(tilt_amp) > np.deg2rad(10.0):
+        raise ValueError("tilt_amp exceeds the 10 degree protocol cap")
+    if abs(yaw_amp) > 1e-9:
+        raise ValueError(
+            "v1 lock-in uses one tilt input; yaw excitation must be run "
+            "as a separate future protocol"
+        )
+    if not scene.task.objects[run.target].container_sealed:
+        raise ValueError("unsupported_micro_shake requires a sealed container track")
     commanded_lift = float(
         lift_height
         if lift_height is not None
-        else (0.130 if backend.name == "allegro" else 0.025)
+        else V1_DEFAULTS.micro_lift_max_wrist_travel_m
     )
+    obj = scene.task.objects[run.target]
+    max_angle = max(abs(tilt_amp), abs(yaw_amp))
+    required_shake_clearance = float(
+        V1_DEFAULTS.micro_lift_target_m
+        + obj.size[0] * np.sin(max_angle)
+        + obj.size[2] * (1.0 - np.cos(max_angle))
+        + V1_DEFAULTS.shake_geometric_margin_m
+    )
+    if target_object_lift is None:
+        resolved_with_band = (
+            required_shake_clearance
+            + float(lift_tolerance)
+            + V1_DEFAULTS.shake_dynamic_sag_reserve_m
+        )
+        if resolved_with_band > max_object_lift:
+            raise ValueError(
+                "shake clearance requires more than the 15 mm v1 object-lift cap; "
+                "reduce tilt_amp"
+            )
+        # The geometric sweep is a minimum clearance.  Centre the controller
+        # band one tolerance above it so the lower edge remains collision-free.
+        resolved_object_lift = float(resolved_with_band)
+    else:
+        resolved_object_lift = _finite(
+            "target_object_lift", target_object_lift
+        )
+        if (
+            resolved_object_lift - float(lift_tolerance)
+            < required_shake_clearance
+            + V1_DEFAULTS.shake_dynamic_sag_reserve_m
+        ):
+            raise ValueError(
+                "target_object_lift tolerance band does not provide shake "
+                "clearance plus the calibrated dynamic-sag reserve"
+            )
+    if resolved_object_lift >= max_object_lift:
+        raise ValueError("target_object_lift reaches the shake object-lift safety cap")
     required_force = (
         float(min_grasp_force)
         if min_grasp_force is not None
         else (7.0 if backend.name == "allegro" else 3.0)
     )
+    _validate_lift_admission(
+        lift_height=commanded_lift,
+        target_object_lift=resolved_object_lift,
+        lift_tolerance=lift_tolerance,
+        max_lift_speed=max_lift_speed,
+        support_loss_dwell=support_loss_dwell,
+        lift_stable_dwell=lift_stable_dwell,
+        max_object_lift=max_object_lift,
+        penetration_limit=penetration_limit,
+        min_grasp_force=required_force,
+    )
+    resolved_analysis_cycles = (
+        max(1, int(round(duration * freq)))
+        if analysis_cycles is None
+        else int(analysis_cycles)
+    )
+    if resolved_analysis_cycles > 8:
+        raise ValueError("analysis_cycles exceeds the protocol cap of 8")
+    n_baseline = max(4, int(dynamic_baseline_time / scene.dt))
+    ramp_steps = max(0, int(round(ramp_cycles / (freq * scene.dt))))
+    analysis_steps = max(
+        8, int(round(resolved_analysis_cycles / (freq * scene.dt)))
+    )
+    n_zero = max(1, int(post_zero_hold_time / scene.dt))
+    if max(n_baseline, ramp_steps, analysis_steps, n_zero) > 20_000:
+        raise ValueError("derived shake step count exceeds the admission cap")
     grasp = _prepare_grasp(
         run,
         penetration_limit=penetration_limit,
@@ -1388,71 +2429,555 @@ def shake(
         run,
         grasp,
         lift_height=commanded_lift,
+        target_object_lift=resolved_object_lift,
+        lift_tolerance=float(lift_tolerance),
+        max_lift_speed=float(max_lift_speed),
+        support_loss_dwell=float(support_loss_dwell),
+        lift_stable_dwell=float(lift_stable_dwell),
+        max_object_lift=float(max_object_lift),
         penetration_limit=penetration_limit,
     )
     if not heft_valid:
         run.fail("heft_invalid")
 
-    force_trace = []
-    torque_trace = []
     valid = heft_valid
+    dynamic_baseline_force = np.zeros(3, dtype=float)
+    dynamic_baseline_torque = np.zeros(3, dtype=float)
+    baseline_force_samples: List[np.ndarray] = []
+    baseline_torque_samples: List[np.ndarray] = []
+    baseline_relative_positions: List[np.ndarray] = []
+    baseline_relative_rotations: List[np.ndarray] = []
+    snapshot = scene.contact_snapshot(run.target)
+    shake_min_lift = float(run.quality.get("lift_distance_m", 0.0))
+    shake_max_lift = shake_min_lift
+    shake_min_geometric_margin = float("inf")
+    shake_min_bottom_clearance = float("inf")
+    shake_max_pose_predicted_center_requirement = 0.0
+    shake_max_object_axis_tilt = 0.0
+    initial_wrist_lift_command = float(
+        run.quality.get("wrist_lift_command_m", 0.0)
+    )
+    shake_wrist_origin = _ctrl(scene, "act_wz") - initial_wrist_lift_command
+    shake_wrist_limit = shake_wrist_origin + commanded_lift
+    shake_z_command = _ctrl(scene, "act_wz")
+    shake_max_extra_wrist_correction = 0.0
+    shake_height_correction_steps = 0
+
+    def shake_height_ok(phase_name: str) -> bool:
+        nonlocal shake_min_lift, shake_max_lift
+        nonlocal shake_min_geometric_margin
+        nonlocal shake_min_bottom_clearance
+        nonlocal shake_max_pose_predicted_center_requirement
+        nonlocal shake_max_object_axis_tilt
+        actual_lift = float(
+            scene.object_center_pos(run.target)[2]
+            - run.quality["lift_start_center_z_m"]
+        )
+        actual_wrist_tilt = abs(float(scene.joint_position("wt")))
+        object_axis_tilt = _object_axis_tilt_rad(scene, run.target)
+        shake_max_object_axis_tilt = max(
+            shake_max_object_axis_tilt, object_axis_tilt
+        )
+        instantaneous_sweep = float(
+            obj.size[0] * np.sin(object_axis_tilt)
+            + obj.size[2] * (1.0 - np.cos(object_axis_tilt))
+        )
+        pose_predicted_center_requirement = float(
+            V1_DEFAULTS.micro_lift_target_m
+            + instantaneous_sweep
+            + V1_DEFAULTS.shake_geometric_margin_m
+        )
+        bottom_clearance = float(
+            scene.object_lowest_exterior_z(run.target)
+            - run.quality["lift_source_support_z_m"]
+        )
+        geometric_margin = bottom_clearance - minimum_bottom_clearance
+        shake_min_lift = min(shake_min_lift, actual_lift)
+        shake_max_lift = max(shake_max_lift, actual_lift)
+        shake_min_bottom_clearance = min(
+            shake_min_bottom_clearance, bottom_clearance
+        )
+        shake_min_geometric_margin = min(
+            shake_min_geometric_margin, geometric_margin
+        )
+        shake_max_pose_predicted_center_requirement = max(
+            shake_max_pose_predicted_center_requirement,
+            pose_predicted_center_requirement,
+        )
+        run.sample(
+            shake_object_lift_m=actual_lift,
+            shake_actual_wrist_tilt_rad=actual_wrist_tilt,
+            shake_object_pose_sweep_bound_m=instantaneous_sweep,
+            shake_bottom_clearance_m=bottom_clearance,
+            shake_geometric_margin_m=geometric_margin,
+            shake_object_axis_tilt_rad=object_axis_tilt,
+            shake_wrist_lift_command_m=(
+                shake_z_command - shake_wrist_origin
+            ),
+        )
+        if actual_lift > max_object_lift:
+            run.fail(f"object_lift_limit_during_{phase_name}")
+            return False
+        if bottom_clearance < minimum_bottom_clearance:
+            run.fail(f"object_below_clearance_during_{phase_name}")
+            return False
+        return True
+
+    # Raise and settle before acquiring the dynamic baseline. During the
+    # baseline/drive/return windows z is frozen, preserving a single commanded
+    # input (tilt) for the lock-in transfer estimate.
     if valid:
-        run.enter("measurement")
-        n = max(1, int(duration / scene.dt))
+        run.enter("height_stabilization")
+        stabilization_tolerance = 0.00025
+        stable_steps_required = max(1, int(np.ceil(0.080 / scene.dt)))
+        remaining_wrist_travel = max(
+            shake_wrist_limit - shake_z_command, 0.0
+        )
+        max_stabilization_steps = (
+            int(
+                np.ceil(
+                    remaining_wrist_travel
+                    / (float(max_lift_speed) * scene.dt)
+                )
+            )
+            + stable_steps_required
+            + 100
+        )
+        stable_steps = 0
         invalid_contact_steps = 0
-        for k in range(n):
-            t = k * scene.dt
-            scene.command(
-                tilt=tilt_amp * np.sin(2 * np.pi * freq * t),
-                yaw=yaw_amp * np.sin(2 * np.pi * freq * t + np.pi / 2),
+        for _ in range(max_stabilization_steps):
+            actual_lift = float(
+                scene.object_center_pos(run.target)[2]
+                - run.quality["lift_start_center_z_m"]
+            )
+            if actual_lift < resolved_object_lift - stabilization_tolerance:
+                shake_height_correction_steps += 1
+                shake_z_command = min(
+                    shake_z_command + float(max_lift_speed) * scene.dt,
+                    shake_wrist_limit,
+                )
+            scene.command(z=shake_z_command, tilt=0.0, yaw=0.0)
+            shake_max_extra_wrist_correction = max(
+                shake_max_extra_wrist_correction,
+                shake_z_command
+                - shake_wrist_origin
+                - initial_wrist_lift_command,
             )
             if not run.step(1):
                 valid = False
                 break
-            current = scene.contact_snapshot(run.target)
+            if not shake_height_ok("height_stabilization"):
+                valid = False
+                break
+            snapshot = scene.contact_snapshot(run.target)
             if grasp.top_entry:
                 grasp.close_alpha, safe = _regulate_top_pinch(
                     run,
                     grasp.close_alpha,
-                    current,
+                    snapshot,
                     target_force_N=grasp.target_force_N,
                 )
                 if not safe:
                     valid = False
                     break
-            force = scene.wrist_force_vec() - grasp.baseline_force
-            torque = scene.wrist_torque_vec() - grasp.baseline_torque
-            force_trace.append(force.copy())
-            torque_trace.append(torque.copy())
-            run.sample(wrist_force_delta_N=force, wrist_torque_delta_Nm=torque)
-            if current.support_contact or current.table_contact:
+            if snapshot.support_contact or snapshot.table_contact:
+                run.fail("support_contact_during_height_stabilization")
                 valid = False
-                run.fail("support_contact_during_shake")
                 break
-            if not _legal_grasp(run, current):
-                invalid_contact_steps += 1
-            else:
+            if _legal_grasp(run, snapshot):
                 invalid_contact_steps = 0
+            else:
+                invalid_contact_steps += 1
             if invalid_contact_steps > 20:
+                run.fail("lost_grasp_during_height_stabilization")
                 valid = False
-                run.fail("lost_grasp_during_shake")
                 break
+            actual_lift = float(
+                scene.object_center_pos(run.target)[2]
+                - run.quality["lift_start_center_z_m"]
+            )
+            if (
+                resolved_object_lift - stabilization_tolerance
+                <= actual_lift
+                <= resolved_object_lift + stabilization_tolerance
+            ):
+                stable_steps += 1
+            else:
+                stable_steps = 0
+            if stable_steps >= stable_steps_required:
+                break
+            if (
+                shake_z_command >= shake_wrist_limit - 1e-9
+                and actual_lift
+                < resolved_object_lift - stabilization_tolerance
+            ):
+                run.fail("shake_height_stabilization_not_reached")
+                valid = False
+                break
+        if stable_steps < stable_steps_required and not run.violations:
+            run.fail("shake_height_stabilization_not_stable")
+            valid = False
+
+    frozen_shake_z = shake_z_command
+
+    if valid:
+        run.enter("dynamic_baseline")
+        invalid_contact_steps = 0
+        for _ in range(n_baseline):
+            scene.command(z=frozen_shake_z, tilt=0.0, yaw=0.0)
+            if not run.step(1):
+                valid = False
+                break
+            if not shake_height_ok("dynamic_baseline"):
+                valid = False
+                break
+            snapshot = scene.contact_snapshot(run.target)
+            if grasp.top_entry:
+                grasp.close_alpha, safe = _regulate_top_pinch(
+                    run,
+                    grasp.close_alpha,
+                    snapshot,
+                    target_force_N=grasp.target_force_N,
+                )
+                if not safe:
+                    valid = False
+                    break
+            if snapshot.support_contact or snapshot.table_contact:
+                run.fail("support_contact_during_dynamic_baseline")
+                valid = False
+                break
+            if _legal_grasp(run, snapshot):
+                invalid_contact_steps = 0
+            else:
+                invalid_contact_steps += 1
+            if invalid_contact_steps > 20:
+                run.fail("lost_grasp_during_dynamic_baseline")
+                valid = False
+                break
+            baseline_force_samples.append(scene.wrist_force_vec().copy())
+            baseline_torque_samples.append(scene.wrist_torque_vec().copy())
+            relative_position, relative_rotation = (
+                scene.relative_object_pose_in_wrist(run.target)
+            )
+            baseline_relative_positions.append(relative_position.copy())
+            baseline_relative_rotations.append(relative_rotation.copy())
+
+    if baseline_force_samples:
+        dynamic_baseline_force = np.median(
+            np.asarray(baseline_force_samples), axis=0
+        )
+        dynamic_baseline_torque = np.median(
+            np.asarray(baseline_torque_samples), axis=0
+        )
+        baseline_relative_position = np.median(
+            np.asarray(baseline_relative_positions), axis=0
+        )
+        baseline_relative_rotation = baseline_relative_rotations[-1]
+        baseline_torque_std = float(
+            np.std(np.asarray(baseline_torque_samples)[:, 1])
+        )
+        supported_delta = [
+            _force_along_world_z(scene, sample - grasp.baseline_force)
+            for sample in baseline_force_samples
+        ]
+        weight_proxy = float(abs(np.median(supported_delta)))
+    else:
+        baseline_relative_position = np.zeros(3, dtype=float)
+        baseline_relative_rotation = np.eye(3, dtype=float)
+        baseline_torque_std = 0.0
+        weight_proxy = 0.0
+        if heft_valid and not run.violations:
+            run.fail("insufficient_dynamic_baseline")
+            valid = False
+
+    dynamic_force_trace: List[np.ndarray] = []
+    dynamic_torque_trace: List[np.ndarray] = []
+    analysis_times: List[float] = []
+    analysis_tilt: List[float] = []
+    analysis_torque: List[np.ndarray] = []
+    analysis_wrist_z: List[float] = []
+    max_translation_drift = 0.0
+    max_rotation_drift = 0.0
+    max_actual_tilt = 0.0
+
+    if valid:
+        run.enter("measurement")
+        invalid_contact_steps = 0
+        total_steps = 2 * ramp_steps + analysis_steps
+        for index in range(total_steps):
+            time_value = (index + 1) * scene.dt
+            if ramp_steps and index < ramp_steps:
+                u = (index + 1) / ramp_steps
+                envelope = u * u * (3.0 - 2.0 * u)
+                in_analysis = False
+            elif index < ramp_steps + analysis_steps:
+                envelope = 1.0
+                in_analysis = True
+            elif ramp_steps:
+                u = (index - ramp_steps - analysis_steps + 1) / ramp_steps
+                inverse = 1.0 - u
+                envelope = inverse * inverse * (3.0 - 2.0 * inverse)
+                in_analysis = False
+            else:
+                envelope = 1.0
+                in_analysis = True
+            commanded_tilt = float(
+                tilt_amp
+                * envelope
+                * np.sin(2.0 * np.pi * freq * time_value)
+            )
+            scene.command(
+                z=frozen_shake_z, tilt=commanded_tilt, yaw=0.0
+            )
+            if not run.step(1):
+                valid = False
+                break
+            if not shake_height_ok("shake"):
+                valid = False
+                break
+            snapshot = scene.contact_snapshot(run.target)
+            if grasp.top_entry:
+                grasp.close_alpha, safe = _regulate_top_pinch(
+                    run,
+                    grasp.close_alpha,
+                    snapshot,
+                    target_force_N=grasp.target_force_N,
+                )
+                if not safe:
+                    valid = False
+                    break
+            if snapshot.support_contact or snapshot.table_contact:
+                run.fail("support_contact_during_shake")
+                valid = False
+                break
+            if _legal_grasp(run, snapshot):
+                invalid_contact_steps = 0
+            else:
+                invalid_contact_steps += 1
+            if invalid_contact_steps > 20:
+                run.fail("lost_grasp_during_shake")
+                valid = False
+                break
+
+            force = scene.wrist_force_vec() - dynamic_baseline_force
+            torque = scene.wrist_torque_vec() - dynamic_baseline_torque
+            actual_tilt = scene.joint_position("wt")
+            max_actual_tilt = max(max_actual_tilt, abs(actual_tilt))
+            relative_position, relative_rotation = (
+                scene.relative_object_pose_in_wrist(run.target)
+            )
+            translation_drift = float(
+                np.linalg.norm(relative_position - baseline_relative_position)
+            )
+            rotation_drift = _rotation_distance_rad(
+                baseline_relative_rotation, relative_rotation
+            )
+            max_translation_drift = max(
+                max_translation_drift, translation_drift
+            )
+            max_rotation_drift = max(max_rotation_drift, rotation_drift)
+            dynamic_force_trace.append(force.copy())
+            dynamic_torque_trace.append(torque.copy())
+            run.sample(
+                commanded_tilt_rad=commanded_tilt,
+                actual_tilt_rad=actual_tilt,
+                wrist_force_dynamic_N=force,
+                wrist_torque_dynamic_Nm=torque,
+                relative_translation_drift_m=translation_drift,
+                relative_rotation_drift_rad=rotation_drift,
+                drive_window="analysis" if in_analysis else "ramp",
+            )
+            if translation_drift > max_dynamic_translation_drift:
+                run.fail("dynamic_translation_drift")
+                valid = False
+                break
+            if rotation_drift > max_dynamic_rotation_drift:
+                run.fail("dynamic_rotation_drift")
+                valid = False
+                break
+            if in_analysis:
+                analysis_times.append(time_value)
+                analysis_tilt.append(actual_tilt)
+                analysis_torque.append(torque.copy())
+                analysis_wrist_z.append(scene.joint_position("wz"))
+
+    ringdown_torque_y: List[float] = []
+    if valid:
+        run.enter("return_to_zero")
+        invalid_contact_steps = 0
+        for _ in range(n_zero):
+            scene.command(z=frozen_shake_z, tilt=0.0, yaw=0.0)
+            if not run.step(1):
+                valid = False
+                break
+            if not shake_height_ok("return_to_zero"):
+                valid = False
+                break
+            snapshot = scene.contact_snapshot(run.target)
+            if grasp.top_entry:
+                grasp.close_alpha, safe = _regulate_top_pinch(
+                    run,
+                    grasp.close_alpha,
+                    snapshot,
+                    target_force_N=grasp.target_force_N,
+                )
+                if not safe:
+                    valid = False
+                    break
+            if snapshot.support_contact or snapshot.table_contact:
+                run.fail("support_contact_after_shake")
+                valid = False
+                break
+            if _legal_grasp(run, snapshot):
+                invalid_contact_steps = 0
+            else:
+                invalid_contact_steps += 1
+            if invalid_contact_steps > 20:
+                run.fail("lost_grasp_after_shake")
+                valid = False
+                break
+            torque = scene.wrist_torque_vec() - dynamic_baseline_torque
+            ringdown_torque_y.append(float(torque[1]))
+            relative_position, relative_rotation = (
+                scene.relative_object_pose_in_wrist(run.target)
+            )
+            translation_drift = float(
+                np.linalg.norm(relative_position - baseline_relative_position)
+            )
+            rotation_drift = _rotation_distance_rad(
+                baseline_relative_rotation, relative_rotation
+            )
+            max_translation_drift = max(
+                max_translation_drift, translation_drift
+            )
+            max_rotation_drift = max(max_rotation_drift, rotation_drift)
+            if translation_drift > max_dynamic_translation_drift:
+                run.fail("post_zero_translation_drift")
+                valid = False
+                break
+            if rotation_drift > max_dynamic_rotation_drift:
+                run.fail("post_zero_rotation_drift")
+                valid = False
+                break
+
+    run.enter("post_zero_check")
+    final_tilt_error = abs(scene.joint_position("wt"))
+    if valid and final_tilt_error > np.deg2rad(0.5):
+        run.fail("wrist_not_returned_to_zero")
+        valid = False
+    run.quality["dynamic_relative_translation_drift_m"] = (
+        max_translation_drift
+    )
+    run.quality["dynamic_relative_rotation_drift_rad"] = max_rotation_drift
+    run.quality["max_actual_tilt_rad"] = max_actual_tilt
+    run.quality["final_tilt_error_rad"] = final_tilt_error
+    run.quality["dynamic_baseline_torque_std_Nm"] = baseline_torque_std
+    run.quality["required_shake_clearance_m"] = required_shake_clearance
+    run.quality["planned_shake_center_lift_m"] = required_shake_clearance
+    run.quality["shake_dynamic_sag_reserve_m"] = (
+        V1_DEFAULTS.shake_dynamic_sag_reserve_m
+    )
+    run.quality["shake_min_object_lift_m"] = shake_min_lift
+    run.quality["shake_max_object_lift_m"] = shake_max_lift
+    run.quality["shake_min_geometric_margin_m"] = (
+        shake_min_geometric_margin
+    )
+    run.quality["shake_min_bottom_clearance_m"] = (
+        shake_min_bottom_clearance
+    )
+    run.quality["shake_minimum_bottom_clearance_gate_m"] = (
+        minimum_bottom_clearance
+    )
+    run.quality["shake_max_pose_predicted_center_requirement_m"] = (
+        shake_max_pose_predicted_center_requirement
+    )
+    run.quality["shake_max_object_axis_tilt_rad"] = (
+        shake_max_object_axis_tilt
+    )
+    run.quality["shake_extra_wrist_correction_m"] = (
+        shake_max_extra_wrist_correction
+    )
+    run.quality["shake_max_wrist_lift_command_m"] = float(
+        shake_z_command - shake_wrist_origin
+    )
+    run.quality["shake_height_correction_steps"] = float(
+        shake_height_correction_steps
+    )
+
+    if len(analysis_times) >= 8:
+        time_arr = np.asarray(analysis_times, dtype=float)
+        tilt_arr = np.asarray(analysis_tilt, dtype=float)
+        torque_arr = np.asarray(analysis_torque, dtype=float)
+        c_tilt = _lockin_coefficient(tilt_arr, time_arr, freq)
+        c_torque = _lockin_coefficient(torque_arr[:, 1], time_arr, freq)
+        wrist_z_arr = np.asarray(analysis_wrist_z, dtype=float)
+        c_wrist_z = _lockin_coefficient(wrist_z_arr, time_arr, freq)
+        if abs(c_tilt) > 1e-9:
+            transfer = c_torque / c_tilt
+            dynamic_gain = float(abs(transfer))
+            dynamic_phase = float(np.angle(transfer))
+        else:
+            dynamic_gain = 0.0
+            dynamic_phase = 0.0
+        input_amplitude = float(abs(c_tilt))
+        torque_amplitude = float(abs(c_torque))
+        angle_tracking_ratio = input_amplitude / max(abs(tilt_amp), 1e-9)
+        angle_snr_db = _lockin_snr_db(tilt_arr, c_tilt, time_arr, freq)
+        dynamic_snr_db = _lockin_snr_db(
+            torque_arr[:, 1], c_torque, time_arr, freq
+        )
+        torque_rms = np.sqrt(np.mean(torque_arr * torque_arr, axis=0))
+        torque_peak = float(np.max(np.linalg.norm(torque_arr, axis=1)))
+        torque_axis_amplitudes = np.asarray(
+            [
+                abs(_lockin_coefficient(torque_arr[:, axis], time_arr, freq))
+                for axis in range(3)
+            ],
+            dtype=float,
+        )
+        wrist_z_response_amplitude = float(abs(c_wrist_z))
+        wrist_z_response_span = float(np.ptp(wrist_z_arr))
+    else:
+        dynamic_gain = dynamic_phase = input_amplitude = torque_amplitude = 0.0
+        angle_tracking_ratio = 0.0
+        angle_snr_db = dynamic_snr_db = float("-inf")
+        torque_rms = np.zeros(3, dtype=float)
+        torque_peak = 0.0
+        torque_axis_amplitudes = np.zeros(3, dtype=float)
+        wrist_z_response_amplitude = 0.0
+        wrist_z_response_span = 0.0
+        if heft_valid and not run.violations:
+            run.fail("insufficient_lockin_samples")
+            valid = False
+    if valid and angle_tracking_ratio < 0.75:
+        run.fail("insufficient_angle_tracking")
+        valid = False
+    if valid and angle_snr_db < 15.0:
+        run.fail("insufficient_angle_snr")
+        valid = False
+    if valid and max_actual_tilt > 1.10 * abs(tilt_amp) + 0.002:
+        run.fail("tilt_amplitude_limit")
+        valid = False
+    run.quality["analysis_wrist_z_command_span_m"] = 0.0
+    run.quality["analysis_wrist_z_response_span_m"] = wrist_z_response_span
+    run.quality["analysis_wrist_z_response_amplitude_m"] = (
+        wrist_z_response_amplitude
+    )
+
+    ringdown_rms = float(
+        np.sqrt(np.mean(np.square(ringdown_torque_y)))
+    ) if ringdown_torque_y else 0.0
+    # Compatibility aliases are retained, but only dynamic_torque_gain is the
+    # uncalibrated v2 feature.  A ProbeBench locked-content calibration must be
+    # subtracted before anything is named a pure slosh gain.
+    slosh_proxy = torque_amplitude
+    fill_proxy = dynamic_gain
 
     run.enter("post_check")
-    if force_trace:
-        force_arr = np.asarray(force_trace)
-        torque_arr = np.asarray(torque_trace)
-        weight_proxy = float(abs(np.median(force_arr[:, 2]))) if valid else 0.0
-        torque_rms = np.sqrt(np.mean(torque_arr * torque_arr, axis=0))
-        torque_norm = np.linalg.norm(torque_arr, axis=1)
-        slosh_proxy = float(np.std(torque_arr[:, 0]) + np.std(torque_arr[:, 1]))
-        torque_peak = float(np.max(torque_norm))
-        fill_proxy = torque_peak + 0.02 * weight_proxy
-    else:
-        weight_proxy = slosh_proxy = torque_peak = fill_proxy = 0.0
-        torque_rms = np.zeros(3)
 
-    object_lifted = run.quality.get("lift_distance_m", 0.0) >= 0.010
+    object_lifted = bool(
+        grasp.established and run.quality.get("lift_started", 0.0) > 0.5
+    )
     cleanup_ok = _place_and_retreat(run, grasp, object_lifted=object_lifted)
     valid = valid and cleanup_ok and not run.violations
     run.phase = "complete" if valid else "retreat"
@@ -1461,6 +2986,22 @@ def shake(
             "weight_proxy_N": weight_proxy if valid else 0.0,
             "fill_proxy": fill_proxy if valid else 0.0,
             "slosh_proxy": slosh_proxy if valid else 0.0,
+            "dynamic_torque_gain_Nm_per_rad": dynamic_gain if valid else 0.0,
+            "dynamic_torque_gain_y_Nm_per_rad": dynamic_gain if valid else 0.0,
+            "dynamic_phase_lag_rad": dynamic_phase if valid else 0.0,
+            "dynamic_torque_phase_y_rad": dynamic_phase if valid else 0.0,
+            "dynamic_snr": dynamic_snr_db if np.isfinite(dynamic_snr_db) else -120.0,
+            "dynamic_lockin_snr_db": (
+                dynamic_snr_db if np.isfinite(dynamic_snr_db) else -120.0
+            ),
+            "angle_tracking_ratio": angle_tracking_ratio,
+            "angle_snr_db": angle_snr_db if np.isfinite(angle_snr_db) else -120.0,
+            "dynamic_input_amplitude_rad": input_amplitude,
+            "dynamic_torque_amplitude_Nm": torque_amplitude,
+            "dynamic_torque_amp_x_Nm": float(torque_axis_amplitudes[0]),
+            "dynamic_torque_amp_y_Nm": float(torque_axis_amplitudes[1]),
+            "dynamic_torque_amp_z_Nm": float(torque_axis_amplitudes[2]),
+            "post_zero_ringdown_rms_y_Nm": ringdown_rms,
             "torque_peak_Nm": torque_peak,
             "torque_rms_x_Nm": float(torque_rms[0]),
             "torque_rms_y_Nm": float(torque_rms[1]),
@@ -1468,19 +3009,45 @@ def shake(
             "lifted": float(heft_valid),
             "hand_contact_group_count": float(len(snapshot.hand_groups)),
         },
-        contact_seconds=len(force_trace) * scene.dt,
+        contact_seconds=(
+            len(baseline_force_samples)
+            + len(dynamic_force_trace)
+            + len(ringdown_torque_y)
+        )
+        * scene.dt,
         params={
             "lift_height": commanded_lift,
+            "target_object_lift": resolved_object_lift,
+            "lift_tolerance": lift_tolerance,
+            "max_lift_speed": max_lift_speed,
+            "support_loss_dwell": support_loss_dwell,
+            "lift_stable_dwell": lift_stable_dwell,
+            "max_object_lift": max_object_lift,
             "tilt_amp": tilt_amp,
             "yaw_amp": yaw_amp,
             "freq": freq,
+            "duration": duration,
+            "analysis_cycles": resolved_analysis_cycles,
+            "analysis_duration": resolved_analysis_cycles / freq,
+            "ramp_cycles": ramp_cycles,
+            "dynamic_baseline_time": dynamic_baseline_time,
+            "post_zero_hold_time": post_zero_hold_time,
+            "max_dynamic_translation_drift": max_dynamic_translation_drift,
+            "max_dynamic_rotation_drift": max_dynamic_rotation_drift,
+            "minimum_bottom_clearance": minimum_bottom_clearance,
             "penetration_limit": penetration_limit,
         },
         raw_summary={
-            "baseline_wrist_force": grasp.baseline_force,
-            "baseline_wrist_torque": grasp.baseline_torque,
+            "supported_baseline_wrist_force": grasp.baseline_force,
+            "supported_baseline_wrist_torque": grasp.baseline_torque,
+            "lifted_dynamic_baseline_wrist_force": dynamic_baseline_force,
+            "lifted_dynamic_baseline_wrist_torque": dynamic_baseline_torque,
             "close_alpha": grasp.close_alpha,
             "heft_valid": heft_valid,
+            "lockin_axis": "tilt_to_wrist_torque_y",
+            "content_proxy_version": scene.task.objects[
+                run.target
+            ].content_proxy_version,
         },
         valid=valid,
     )
@@ -1489,27 +3056,64 @@ def shake(
 def slide(
     executor: ProbeBackend | AllegroProbeScene,
     target: int,
-    preload: float = 2.0,
-    distance: float = 0.040,
-    duration: float = 0.8,
+    preload: float = V1_DEFAULTS.slide_preload_N,
+    distance: float = V1_DEFAULTS.slide_one_way_distance_m,
+    duration: float = V1_DEFAULTS.slide_one_way_duration_s,
     force_limit: float = 12.0,
     recovery_steps: int = 30,
+    *,
+    mode: str | None = None,
+    protocol_id: str = PROBE_PROTOCOL_ID,
 ) -> ProbeResult:
     backend = as_backend(executor)
-    run = _Run(backend, "slide", int(target))
+    run = _Run(
+        backend,
+        "slide",
+        int(target),
+        mode=canonical_probe_mode("slide", mode),
+        protocol_id=validate_protocol_id(protocol_id),
+    )
+    run.sensor_profile_id = "sim.central_probe_touch+probe_ft.v1"
     run.target_penetration_limit_m = 0.001
     scene = run.scene
+    preload = _finite("preload", preload)
+    distance = _finite("distance", distance)
+    duration = _finite("duration", duration)
+    force_limit = _finite("force_limit", force_limit)
+    if preload <= 0.0:
+        raise ValueError("preload must be positive")
+    if abs(distance) <= 1e-6:
+        raise ValueError("distance must be non-zero")
+    if abs(distance) > 0.25:
+        raise ValueError("distance exceeds the 250 mm admission cap")
+    if not 0.05 <= duration <= 5.0:
+        raise ValueError("duration must be in [0.05, 5.0] s")
+    if force_limit < preload:
+        raise ValueError("force_limit must be at least preload")
+    if not isinstance(recovery_steps, (int, np.integer)) or recovery_steps < 0:
+        raise ValueError("recovery_steps must be a non-negative integer")
+    if recovery_steps > 5_000:
+        raise ValueError("recovery_steps exceeds the admission cap")
+    n = max(4, int(duration / scene.dt))
+    if n > 20_000:
+        raise ValueError("derived slide step count exceeds the admission cap")
     x0 = scene.candidate_x(run.target)
     start_x = x0 - 0.5 * distance
 
     run.enter("approach")
-    _probe_above(run, x=start_x, clearance=0.030)
-    force_baseline = _mean_vec(run, scene.probe_force_vec, 40)
+    approached = _probe_above(run, x=start_x, clearance=0.030)
+    force_baseline = (
+        _mean_vec(run, scene.probe_force_vec, 40)
+        if approached and not run.violations
+        else np.zeros(3, dtype=float)
+    )
 
     run.enter("guarded_contact")
     extension = 0.0
     contacted = False
-    for extension in np.linspace(0.0, 0.17, 120):
+    for extension in (
+        np.linspace(0.0, 0.17, 120) if not run.violations else ()
+    ):
         scene.command(probe=float(extension))
         if not run.step(4):
             break
@@ -1531,8 +3135,11 @@ def slide(
     completed_steps = 0
     max_lost_count = 0
     actual_path_fraction = 0.0
+    return_path_fraction = 0.0
     endpoint_settle_steps = 0
-    n = max(4, int(duration / scene.dt))
+    return_endpoint_settle_steps = 0
+    return_error_m = abs(float(distance))
+    start_tip_x = float("nan")
     if contacted and not run.violations:
         stable_contact_steps = 0
         stable_forces = []
@@ -1580,12 +3187,15 @@ def slide(
                 )
             )
             target_contact = scene.probe_contact_snapshot(run.target).target_contact
-            trace.append((fn, fvec.copy(), actual_path_fraction, target_contact))
+            trace.append(
+                (fn, fvec.copy(), actual_path_fraction, target_contact, "outbound")
+            )
             run.sample(
                 normal_force_N=fn,
                 tangential_force_N=ft,
                 commanded_path_fraction=float(alpha),
                 path_fraction=actual_path_fraction,
+                path_leg="outbound",
             )
             if fn > force_limit:
                 run.fail("force_limit")
@@ -1639,13 +3249,126 @@ def slide(
                 run.fail("lost_contact")
                 break
 
+        forward_tip_x = float(scene.probe_tip_pos()[0])
+        if actual_path_fraction >= 0.95 and not run.violations:
+            for alpha in np.linspace(0.0, 1.0, n):
+                fn = scene.probe_touch()
+                error = preload - fn
+                integral = float(
+                    np.clip(integral + error * scene.dt, -2.0, 2.0)
+                )
+                extension = float(
+                    np.clip(
+                        extension + 0.00025 * error + 0.00008 * integral,
+                        0.0,
+                        0.17,
+                    )
+                )
+                scene.command(
+                    x=start_x + (1.0 - float(alpha)) * distance,
+                    probe=extension,
+                )
+                if not run.step(1):
+                    break
+                fn = scene.probe_touch()
+                fvec = scene.probe_force_vec() - force_baseline
+                ft = float(np.linalg.norm(fvec[:2]))
+                if fn < 0.2 * preload:
+                    lost_count += 1
+                else:
+                    lost_count = 0
+                max_lost_count = max(max_lost_count, lost_count)
+                return_path_fraction = float(
+                    np.clip(
+                        abs(float(scene.probe_tip_pos()[0]) - forward_tip_x)
+                        / max(abs(distance), 1e-9),
+                        0.0,
+                        1.0,
+                    )
+                )
+                target_contact = scene.probe_contact_snapshot(
+                    run.target
+                ).target_contact
+                trace.append(
+                    (
+                        fn,
+                        fvec.copy(),
+                        return_path_fraction,
+                        target_contact,
+                        "return",
+                    )
+                )
+                run.sample(
+                    normal_force_N=fn,
+                    tangential_force_N=ft,
+                    commanded_path_fraction=float(alpha),
+                    path_fraction=return_path_fraction,
+                    path_leg="return",
+                )
+                if fn > force_limit:
+                    run.fail("force_limit")
+                    break
+                if lost_count > recovery_steps:
+                    run.fail("lost_contact")
+                    break
+
+            for _ in range(200):
+                if return_path_fraction >= 0.95 or run.violations:
+                    break
+                fn = scene.probe_touch()
+                error = preload - fn
+                integral = float(
+                    np.clip(integral + error * scene.dt, -2.0, 2.0)
+                )
+                extension = float(
+                    np.clip(
+                        extension + 0.00025 * error + 0.00008 * integral,
+                        0.0,
+                        0.17,
+                    )
+                )
+                servo_lead = 0.008 * (1.0 if distance >= 0.0 else -1.0)
+                scene.command(x=start_x - servo_lead, probe=extension)
+                if not run.step(1):
+                    break
+                return_endpoint_settle_steps += 1
+                fn = scene.probe_touch()
+                if fn < 0.2 * preload:
+                    lost_count += 1
+                else:
+                    lost_count = 0
+                max_lost_count = max(max_lost_count, lost_count)
+                return_path_fraction = float(
+                    np.clip(
+                        abs(float(scene.probe_tip_pos()[0]) - forward_tip_x)
+                        / max(abs(distance), 1e-9),
+                        0.0,
+                        1.0,
+                    )
+                )
+                if fn > force_limit:
+                    run.fail("force_limit")
+                    break
+                if lost_count > recovery_steps:
+                    run.fail("lost_contact")
+                    break
+            return_error_m = abs(float(scene.probe_tip_pos()[0]) - start_tip_x)
+
     run.enter("post_check")
-    completion = actual_path_fraction
+    completion = min(actual_path_fraction, return_path_fraction)
     run.quality["path_completion_ratio"] = completion
+    run.quality["outbound_path_completion_ratio"] = actual_path_fraction
+    run.quality["return_path_completion_ratio"] = return_path_fraction
+    run.quality["round_trip_return_error_m"] = return_error_m
     run.quality["max_lost_contact_steps"] = float(max_lost_count)
     run.quality["endpoint_settle_steps"] = float(endpoint_settle_steps)
+    run.quality["return_endpoint_settle_steps"] = float(
+        return_endpoint_settle_steps
+    )
     if completion < 0.95:
         run.fail("path_incomplete")
+    if return_error_m > 0.10 * abs(distance):
+        run.fail("round_trip_return_error")
 
     if trace:
         fn_arr = np.asarray([item[0] for item in trace])
@@ -1660,10 +3383,24 @@ def slide(
             fn_median = float(np.median(fn_arr[mask]))
             vibration = float(np.std(fn_arr[mask]))
             contact_fraction = float(mask.mean())
+            outbound_mask = mask & np.asarray(
+                [item[4] == "outbound" for item in trace], dtype=bool
+            )
+            return_mask = mask & np.asarray(
+                [item[4] == "return" for item in trace], dtype=bool
+            )
+            mu_outbound = float(
+                np.median(ft_arr[outbound_mask] / (fn_arr[outbound_mask] + 1e-6))
+            ) if outbound_mask.any() else 0.0
+            mu_return = float(
+                np.median(ft_arr[return_mask] / (fn_arr[return_mask] + 1e-6))
+            ) if return_mask.any() else 0.0
         else:
             mu = ft_median = fn_median = vibration = contact_fraction = 0.0
+            mu_outbound = mu_return = 0.0
     else:
         mu = ft_median = fn_median = vibration = contact_fraction = 0.0
+        mu_outbound = mu_return = 0.0
     run.quality["contact_fraction"] = contact_fraction
     if contact_fraction < 0.80:
         run.fail("insufficient_contact_fraction")
@@ -1679,12 +3416,16 @@ def slide(
             "Ft_median_N": ft_median,
             "Fn_median_N": fn_median,
             "slide_vibration": vibration,
+            "friction_ratio_outbound": mu_outbound,
+            "friction_ratio_return": mu_return,
+            "friction_direction_asymmetry": abs(mu_outbound - mu_return),
         },
         contact_seconds=len(trace) * scene.dt,
         params={
             "preload": preload,
             "distance": distance,
             "duration": duration,
+            "round_trip": True,
             "recovery_steps": recovery_steps,
         },
         raw_summary={
@@ -1707,6 +3448,7 @@ def run_probe(
     executor: ProbeBackend | AllegroProbeScene,
     primitive: str,
     target: int,
+    protocol_id: str = PROBE_PROTOCOL_ID,
     **params: Any,
 ) -> ProbeResult:
     backend = as_backend(executor)
@@ -1724,4 +3466,9 @@ def run_probe(
     target = int(target)
     if not 0 <= target < backend.scene.n:
         raise IndexError(f"target {target} outside [0, {backend.scene.n})")
-    return _DISPATCH[primitive](backend, target, **params)
+    return _DISPATCH[primitive](
+        backend,
+        target,
+        protocol_id=validate_protocol_id(protocol_id),
+        **params,
+    )

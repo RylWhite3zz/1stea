@@ -31,6 +31,12 @@ from allegro_probe.pose_manipulation import (
     short_can_top_pinch_template,
 )
 from allegro_probe.primitives import primitive_for_family, run_probe
+from allegro_probe.protocols import (
+    FEATURE_SCHEMA_VERSION,
+    PROBE_PROTOCOL_ID,
+    V1_DEFAULTS,
+    ProbeProtocolDefaults,
+)
 from allegro_probe.scene import AllegroProbeScene, SceneConfig
 
 __all__ = [
@@ -42,6 +48,7 @@ __all__ = [
     "ManipulationPlan",
     "ManipulationPlanDecision",
     "POSE_MANIPULATION_SCHEMA_VERSION",
+    "FEATURE_SCHEMA_VERSION",
     "FixedPlaceSpec",
     "GraspCandidate",
     "ObjectSpec",
@@ -50,6 +57,7 @@ __all__ = [
     "ProbeCommand",
     "ProbeHarness",
     "ProbeBackend",
+    "ProbeProtocolDefaults",
     "ProbeResult",
     "ProbeSceneSpec",
     "PoseConditionedPickPlaceRequest",
@@ -58,6 +66,8 @@ __all__ = [
     "SceneConfig",
     "ShortCanPickPlaceRequest",
     "ReferenceProbeBackend",
+    "PROBE_PROTOCOL_ID",
+    "V1_DEFAULTS",
     "make_demo_scene",
     "build_short_can_pick_place_plan",
     "build_pose_conditioned_short_can_plan",

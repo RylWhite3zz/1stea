@@ -8,6 +8,7 @@ from typing import Any, Dict, Literal, Mapping, Protocol
 from allegro_probe.backends import ProbeBackend, as_backend
 from allegro_probe.models import ProbeResult
 from allegro_probe.primitives import run_probe
+from allegro_probe.protocols import PROBE_PROTOCOL_ID, validate_protocol_id
 from allegro_probe.scene import AllegroProbeScene
 
 
@@ -16,6 +17,9 @@ class ProbeCommand:
     primitive: Literal["poke", "heft", "shake", "slide"]
     target: int
     params: Dict[str, Any] = field(default_factory=dict)
+    # Appended so ProbeCommand(primitive, target, params) remains source-compatible.
+    mode: str | None = None
+    protocol_id: str = PROBE_PROTOCOL_ID
 
 
 @dataclass(frozen=True)
@@ -57,9 +61,22 @@ class ProbeHarness:
         self.scene = self.backend.scene
 
     def execute(self, command: ProbeCommand) -> ProbeResult:
+        protocol_id = validate_protocol_id(command.protocol_id)
+        params = dict(command.params)
+        if "protocol_id" in params:
+            if str(params.pop("protocol_id")) != protocol_id:
+                raise ValueError(
+                    "ProbeCommand.protocol_id conflicts with params['protocol_id']"
+                )
+        if "mode" in params and command.mode is not None:
+            if str(params["mode"]) != str(command.mode):
+                raise ValueError("ProbeCommand.mode conflicts with params['mode']")
+        if command.mode is not None:
+            params["mode"] = command.mode
         return run_probe(
             self.backend,
             primitive=command.primitive,
             target=command.target,
-            **command.params,
+            protocol_id=protocol_id,
+            **params,
         )

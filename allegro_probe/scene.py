@@ -1,7 +1,8 @@
 """MuJoCo scene shared by reference-rig and Allegro probe backends.
 
-Both variants use a 6-DoF wrist carriage. ``poke`` and ``slide`` use an instrumented
-probe; ``heft`` and ``shake`` use either a reference gripper or articulated Allegro.
+Both variants use a 6-DoF wrist carriage. Reference ``poke`` and both ``slide`` paths
+use an instrumented central probe; Allegro ``poke`` uses its index fingertip.
+``heft`` and ``shake`` use either a reference gripper or articulated Allegro.
 """
 
 from __future__ import annotations
@@ -418,7 +419,19 @@ class AllegroProbeScene:
             "th_base", "th_proximal", "th_medial", "th_distal", "th_tip",
         ):
             probe_excludes.append(f'<exclude body1="probe_force_body" body2="{body}"/>')
-        return f"<contact>{allegro_contact}{''.join(probe_excludes)}</contact>"
+        fingertip_pairs = []
+        if self.task.family == "stiffness":
+            for obj in self.task.objects:
+                fingertip_pairs.append(
+                    f'<pair geom1="ff_tip_fingertip_collision" '
+                    f'geom2="obj{obj.index}_geom" condim="6" '
+                    'friction="3.5 3.5 0.06 0.004 0.004" '
+                    'solref="0.004 1" solimp="0.95 0.995 0.001"/>'
+                )
+        return (
+            f"<contact>{allegro_contact}{''.join(probe_excludes)}"
+            f"{''.join(fingertip_pairs)}</contact>"
+        )
 
     def _object_xml(self, obj: ObjectSpec, x: float) -> Tuple[str, str, Optional[str]]:
         rgba = _fmt(obj.rgba)
@@ -484,13 +497,34 @@ class AllegroProbeScene:
         liquid_xml = ""
         if obj.family == "fill" and obj.liquid_mass_kg > 1e-5:
             r = max(min(sx, sy) * 0.32, 0.006)
-            rng = max(obj.slosh_range_m, 0.001)
+            rng = float(obj.slosh_range_m)
+            mobile = bool(
+                obj.content_mobility_class not in {"none", "fixed"}
+                and rng > 0.0
+                and obj.slosh_natural_frequency_Hz > 0.0
+            )
+            if mobile:
+                omega = 2.0 * np.pi * float(obj.slosh_natural_frequency_Hz)
+                stiffness = float(obj.liquid_mass_kg * omega * omega)
+                damping = float(
+                    2.0
+                    * obj.slosh_damping_ratio
+                    * obj.liquid_mass_kg
+                    * omega
+                )
+                slosh_joint_xml = f"""
+    <joint name="obj{obj.index}_slosh_x" type="slide" axis="1 0 0"
+           range="{-rng:.6g} {rng:.6g}" damping="{damping:.6g}" stiffness="{stiffness:.6g}"/>
+    <joint name="obj{obj.index}_slosh_y" type="slide" axis="0 1 0"
+           range="{-rng:.6g} {rng:.6g}" damping="{damping:.6g}" stiffness="{stiffness:.6g}"/>
+"""
+            else:
+                # A child body without a joint is welded to the shell.  This is
+                # a genuine fixed-content control, not a 1 mm almost-mobile mass.
+                slosh_joint_xml = ""
             liquid_xml = f"""
   <body name="obj{obj.index}_liquid" pos="0 0 {-0.30 * sz:.6g}">
-    <joint name="obj{obj.index}_slosh_x" type="slide" axis="1 0 0"
-           range="{-rng:.6g} {rng:.6g}" damping="0.8" stiffness="4.0"/>
-    <joint name="obj{obj.index}_slosh_y" type="slide" axis="0 1 0"
-           range="{-rng:.6g} {rng:.6g}" damping="0.8" stiffness="4.0"/>
+    {slosh_joint_xml}
     <geom name="obj{obj.index}_hidden_liquid" type="sphere" size="{r:.6g}"
           mass="{obj.liquid_mass_kg:.6g}" rgba="0.1 0.2 0.8 0"
           contype="0" conaffinity="0"/>
@@ -511,14 +545,21 @@ class AllegroProbeScene:
     def _carriage_xml(self, palm_xml: str) -> Tuple[str, str, str]:
         cfg = self.config
         inert = '<inertial pos="0 0 0" mass="0.08" diaginertia="8e-5 8e-5 8e-5"/>'
+        central_probe_active = bool(
+            self.task.family == "material"
+            or (
+                self.task.family == "stiffness"
+                and cfg.backend == "reference"
+            )
+        )
         probe_collision = (
             'contype="1" conaffinity="1"'
-            if self.task.family in {"stiffness", "material"}
+            if central_probe_active
             else 'contype="0" conaffinity="0"'
         )
         probe_rgba = (
             "0.9 0.15 0.10 1"
-            if self.task.family in {"stiffness", "material"}
+            if central_probe_active
             else "0.9 0.15 0.10 0"
         )
         # The capsule itself is the visualization.  Keep the touch/frame site
@@ -656,6 +697,21 @@ class AllegroProbeScene:
             self.geom_body_name[gid] = (
                 mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_BODY, bid) or ""
             )
+        self.object_exterior_geom_ids: Dict[int, Tuple[int, ...]] = {}
+        for index in range(self.n):
+            prefix = f"obj{index}_"
+            ids = tuple(
+                gid
+                for name, gid in self.geom.items()
+                if name.startswith(prefix)
+                and "pedestal" not in name
+                and "hidden_liquid" not in name
+            )
+            if not ids:
+                raise RuntimeError(
+                    f"object {index} has no indexed exterior collision geoms"
+                )
+            self.object_exterior_geom_ids[index] = ids
         probe_gid = self.geom.get("probe_tip_geom")
         if probe_gid is not None:
             self._probe_contype = int(self.model.geom_contype[probe_gid])
@@ -735,14 +791,20 @@ class AllegroProbeScene:
     def set_probe_collision(self, enabled: bool) -> None:
         """Compatibility shim.
 
-        Probe collision is fixed when the model is compiled: enabled for poke/slide
-        scenes and disabled for heft/shake scenes.  Runtime collision spoofing is
-        deliberately rejected.
+        Probe collision is fixed when the model is compiled: enabled for reference
+        stiffness and all material scenes, disabled for Allegro stiffness and all
+        mass/fill scenes. Runtime collision spoofing is deliberately rejected.
         """
         gid = self.geom.get("probe_tip_geom")
         if gid is None:
             return
-        expected = self.task.family in {"stiffness", "material"}
+        expected = bool(
+            self.task.family == "material"
+            or (
+                self.task.family == "stiffness"
+                and self.config.backend == "reference"
+            )
+        )
         if bool(enabled) != expected:
             raise RuntimeError(
                 "probe collision is fixed per scene; construct the matching family/backend"
@@ -902,6 +964,56 @@ class AllegroProbeScene:
         world_top_offset = quaternion_wxyz_to_matrix(self.object_quat(i)) @ local_top
         return self.object_pos(i) - world_top_offset
 
+    def _geom_vertical_extent(self, gid: int) -> float:
+        """Return one analytic geom's half extent projected onto world z."""
+
+        mj = self.mujoco
+        geom_type = int(self.model.geom_type[gid])
+        size = np.asarray(self.model.geom_size[gid], dtype=float)
+        rotation = np.asarray(self.data.geom_xmat[gid], dtype=float).reshape(3, 3)
+        if geom_type == int(mj.mjtGeom.mjGEOM_BOX):
+            return float(np.sum(np.abs(rotation[2, :]) * size[:3]))
+        if geom_type == int(mj.mjtGeom.mjGEOM_CYLINDER):
+            axis_z = abs(float(rotation[2, 2]))
+            radial_z = float(np.sqrt(max(1.0 - axis_z * axis_z, 0.0)))
+            return float(size[1] * axis_z + size[0] * radial_z)
+        if geom_type == int(mj.mjtGeom.mjGEOM_SPHERE):
+            return float(size[0])
+        if geom_type == int(mj.mjtGeom.mjGEOM_ELLIPSOID):
+            return float(
+                np.sqrt(np.sum(np.square(rotation[2, :] * size[:3])))
+            )
+        raise RuntimeError(
+            "analytic vertical extent does not support geom type "
+            f"{geom_type} for gid={gid}"
+        )
+
+    def object_lowest_exterior_z(self, i: int) -> float:
+        """Return the exact lowest world-z support point of exterior geoms.
+
+        Probe objects currently use analytic box/cylinder collision geometry.
+        This support-function calculation follows each geom's live MuJoCo pose,
+        so object/wrist relative rotation cannot be hidden by a wrist-angle proxy.
+        """
+
+        lows = [
+            float(self.data.geom_xpos[gid, 2])
+            - self._geom_vertical_extent(gid)
+            for gid in self.object_exterior_geom_ids[int(i)]
+        ]
+        return float(min(lows))
+
+    def object_source_support_z(self, i: int) -> float:
+        """Return the table/pedestal top supporting an object at canonical reset."""
+
+        support_gid = self.geom.get(f"obj{int(i)}_pedestal")
+        if support_gid is None:
+            support_gid = self.geom["table"]
+        return float(
+            self.data.geom_xpos[support_gid, 2]
+            + self._geom_vertical_extent(support_gid)
+        )
+
     def set_object_pose(
         self,
         i: int,
@@ -989,6 +1101,16 @@ class AllegroProbeScene:
             )
         )
 
+    def fingertip_touch(self, prefix: str) -> float:
+        """Return one Allegro fingertip touch scalar by canonical finger name."""
+
+        value = str(prefix)
+        if self.config.backend != "allegro":
+            raise RuntimeError("fingertip_touch requires backend='allegro'")
+        if value not in {"ff", "mf", "rf", "th"}:
+            raise ValueError("prefix must be one of ff/mf/rf/th")
+        return float(self.sensor(f"{value}_tip_touch")[0])
+
     def fingertip_positions(self) -> Dict[str, np.ndarray]:
         if self.config.backend == "reference":
             return {}
@@ -1012,6 +1134,28 @@ class AllegroProbeScene:
 
     def relative_object_position(self, i: int) -> np.ndarray:
         return self.object_pos(i) - self.wrist_pos()
+
+    def relative_object_pose_in_wrist(
+        self, i: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return object-center pose expressed in the live wrist frame."""
+
+        wrist_rotation = quaternion_wxyz_to_matrix(self.wrist_quat())
+        object_rotation = quaternion_wxyz_to_matrix(self.object_quat(i))
+        translation = wrist_rotation.T @ (
+            self.object_center_pos(i) - self.wrist_pos()
+        )
+        rotation = wrist_rotation.T @ object_rotation
+        return translation, rotation
+
+    def joint_position(self, name: str) -> float:
+        value = str(name)
+        sensor_name = f"{value}_pos"
+        if sensor_name in self.sensor_index:
+            return float(self.sensor(sensor_name)[0])
+        if value not in self.joint_qadr:
+            raise KeyError(f"unknown joint {value!r}")
+        return float(self.data.qpos[self.joint_qadr[value]])
 
     def probe_contact_snapshot(self, i: int) -> ProbeContactSnapshot:
         """Classify all contacts made by the central probe collision capsule."""

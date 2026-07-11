@@ -25,8 +25,8 @@ v1 限定为四个 family/primitive：
 
 | backend | `poke/slide` | `heft/shake` |
 | --- | --- | --- |
-| `reference` | 中央仪器化探针 | 带底缘承托钩的双指参考夹爪 |
-| `allegro` | 100 mm 中央仪器化探针 | 完整碰撞 Menagerie Allegro 的 top-entry 中指—拇指夹持 |
+| `reference` | `poke/slide` 均用中央仪器化探针 | 带底缘承托钩的双指参考夹爪 |
+| `allegro` | `poke` 用食指指腹触觉；`slide` 用中央仪器化探针 | 完整碰撞 Menagerie Allegro 的 top-entry 中指—拇指夹持 |
 
 创建后端：
 
@@ -67,15 +67,22 @@ approach
 
 关键 gate：
 
-- `poke`：以 `probe_force` 法向分量闭环；只有 contact buffer 证明中央 probe
-  接触指定 target 后才承认 touch，并将真实 probe 穿透限制为 1 mm。
+- `poke`：reference 以中央 `probe_touch/probe_force` 闭环；Allegro 将手在高位翻转，
+  只允许 `ff_tip_fingertip_collision` 接触指定 target，并以 `ff_tip_touch` 闭环。
+  Allegro 默认目标/上限为 0.8/1.0 N，目标穿透上限 0.5 mm；非目标手指、指节、
+  掌面、桌面、邻物或中央 probe 接触均立即无效。
 - `slide`：先建立稳定 preload，再以 PI 维持法向力；路径完成率使用实际 tip 位移，
   允许短时失联恢复，有效 target 接触占比达标后才有效。
-- `heft`：reference 使用左右夹爪；Allegro 先在高位翻腕 `Rx(pi)`，再从物体上方
-  以中指—拇指夹住 top lip，闭环维持约 7 N 总法向力后抬升 130 mm。掌心、base、proximal、
-  非活动手指和邻物接触都不能被算成有效抓取。
-- `shake`：必须先通过与 heft 相同的抓取和脱离支撑 gate；shake 过程中重新接触
-  支撑、持续丢失对向接触或掉落都会使结果无效。
+- `heft`：reference 使用左右夹爪；Allegro 在高位翻腕 `Rx(pi)`，从上方以中指—拇指
+  夹住 top lip。腕部最多允许移动 35 mm，但停止条件看物体几何中心的实际抬升：
+  默认 8 mm、20 mm/s、连续脱离支撑 120 ms、目标带稳定 80 ms。测量是 200 ms
+  静态 hold，重量沿世界重力轴从“支撑中 baseline → 抬升后受力”得到。
+- `shake`：必须先通过同一 unsupported lift gate；3°/3 Hz 单轴 micro-shake 前根据
+  容器半径和半高补偿底面扫掠净空，再采 200 ms 抬升后动态 baseline。分析窗口使用
+  实际 wrist tilt 的整周期 lock-in。额外高度补偿只能发生在 baseline 前的独立稳定
+  阶段；baseline/drive/return 固定 wrist z，避免把双输入响应伪装成单轴 feature。
+  每步以物体所有外部碰撞 geom 的实时最低点检查相对桌面/托架至少 1.5 mm 净空，
+  不用 wrist 角度代替容器自身姿态。动作结束必须精确回零并复核支撑、抓持和相对位姿。
 
 Allegro 的 mass/fill 默认让物体直接落在桌面，不使用托架；reference 为暴露底缘仍
 保留小型中央 pedestal。两条路线都必须在 heft/shake 测量前连续确认 target 已脱离
@@ -84,7 +91,8 @@ table/pedestal。测量结束后不再空中松手：控制器先把物体放回
 
 碰撞角色在 scene 编译时固定：
 
-- stiffness/material scene 启用中央 probe 碰撞。
+- reference stiffness 与两个 backend 的 material scene 启用中央 probe 碰撞；
+  Allegro stiffness scene 隐藏并禁用中央 probe，只启用食指指腹接触。
 - mass/fill scene 隐藏并禁用中央 probe 碰撞。
 - Allegro probe scene 默认编译 palm/base/proximal 在内的全部解析碰撞 proxy；视觉
   mesh 仍是 Menagerie 的无碰撞渲染层，但不再存在“看得见却没有对应刚体 proxy”的手部。
@@ -101,6 +109,9 @@ table/pedestal。测量结束后不再空中松手：控制器先把物体放回
 
 ```text
 scene_id                     probe/manipulation 场景 provenance
+protocol_id / mode            版本化动作语义，不允许 supported fallback 冒充
+feature_schema                feature key 的版本
+sensor_profile_id             实际 effector/sensor 组合
 status / controller_status   控制结果
 valid                        feature 是否可作为可信 probe 信号
 phase_reached                最后到达的状态机阶段
@@ -128,6 +139,14 @@ trace                        可选完整时序
   penetration
 - manipulation 额外区分每指法向力、手接触到的物体 geom，以及手—桌面/手—托架
   接触，避免把环境碰撞误当成有效抓取或放置接触
+
+fill 默认 demo 是 `track="content_mobility"`：fixed/damped/mobile 三个不透明密封容器
+具有相同外壳、总质量、静态填充率、内部质量、静态质心和 joint range，只改变内部质量
+是否可动及阻尼。旧的 fill-ratio 对照仍可用 `make_demo_scene(..., track="fill_ratio")`
+显式生成，但也保持总质量一致，避免 `heft` 重量捷径。
+
+完整 v2 动作、gate、字段与 ProbeBench 适配边界见
+[`docs/v1/0710/probe_protocol_v2.md`](docs/v1/0710/probe_protocol_v2.md)。
 
 ## Allegro short_can pick/place
 

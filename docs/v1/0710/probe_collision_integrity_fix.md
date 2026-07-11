@@ -1,5 +1,9 @@
 # 四个 probe 动作的穿模修复与验收
 
+> 2026-07-11 更新：本文保留碰撞修复的根因记录；动作参数和 feature 的当前权威定义
+> 已升级到 [`probe_protocol_v2.md`](probe_protocol_v2.md)。下文同步了会影响碰撞角色的
+> 关键变化。
+
 ## 1. 修复目标
 
 本次只处理当前 v1 的 `poke / heft / shake / slide`。目标不是让画面“看起来更顺”，
@@ -23,15 +27,19 @@ hand-other-object、hand-table、palm-object 等接触；retreat 发生在有效
 
 ### 3.1 `poke / slide`
 
-- 中央 probe 有效长度为 100 mm、半径为 5 mm；`probe_tip_pos()` 是 capsule 最下方
+- reference `poke` 与两个 backend 的 `slide` 使用中央 probe；它的有效长度为
+  100 mm、半径为 5 mm；`probe_tip_pos()` 是 capsule 最下方
   物理表面，`wz_for_tip_z()` 与这个 frame 精确互逆。
+- Allegro `poke` 不再用中央 probe：stiffness scene 在编译时将其隐藏并禁碰，手在
+  高位翻到 `Rx(pi)` 后，以实时对齐的 `ff_tip` 和 `ff_tip_touch` 执行法向力闭环。
+  仅 `ff_tip_fingertip_collision` 可以接触 target，穿透硬上限 0.5 mm。
 - probe position joint 使用 `damping=40`、actuator 使用 `kp=40`；material 接触面使用
   `solref="0.017 1"`，降低 position servo 把工具硬压入表面的数值穿透。
 - `probe_contact_snapshot(target)` 必须证明 probe 接触的是指定 target；probe—桌面、
   托架、其他候选或其他 geom 均失败。
-- 手/掌不能接触 target；真实 probe 穿透硬上限为 1 mm。
-- slide 在横移前建立 30 步稳定 preload；完成率来自实际 tip x 位移，而非 command
-  插值进度。末端允许一个有界 servo settling 窗口，但它不混入摩擦统计窗口。
+- central-probe 路径中手/掌不能接触 target，真实 probe 穿透硬上限为 1 mm。
+- slide 在横移前建立 30 步稳定 preload；执行 `start→end→start`，两腿完成率都来自
+  实际 tip x 位移。末端有界 servo settling 不混入摩擦统计窗口。
 
 ### 3.2 Allegro `heft / shake`
 
@@ -44,7 +52,9 @@ hand-other-object、hand-table、palm-object 等接触；retreat 发生在有效
 - 16-DoF 手目标按 `synergy(0.10) → synergy(0.80) → synergy(0.98)` 分段插值。
 - 只有 `mf + th`、目标 `*_top_lip` 和 fingertip/thumbtip/distal link 白名单构成合法
   top pinch；总法向力目标为 7 N，硬上限 20 N，穿透上限 5.5 mm。
-- 默认 lift 为 130 mm；lift、heft 正弦保持和 shake tilt/yaw 全程继续调节 closure。
+- wrist travel 现在只是 35 mm 安全上限；heft 以物体几何中心实际抬升 8 mm 为目标，
+  并要求支撑消失 120 ms。shake 先补偿 3° 倾转的底缘扫掠净空，再执行单轴 3 Hz
+  micro-shake。两者全程继续调节 closure。
 - 测量结束后先归零 tilt/yaw、下降到原桌面接触稳定、低刚度完全张手、垂直退到
   高位，最后才将 roll 转回 0。安全验收包含 place/release/retreat。
 
@@ -60,7 +70,8 @@ reference 后端仍使用真实可见且可碰撞的左右 jaw/hook 和窄 pedes
 - hand—table、hand—pedestal；
 - hand—其他候选、target—其他候选；
 - probe—非 target；
-- `poke/slide` 中任何 hand—target；
+- central-probe `poke/slide` 中任何 hand—target；Allegro fingertip `poke` 中任何非
+  `ff_tip_fingertip_collision` 的 hand—target；
 - `heft/shake` 中任何 probe—target；
 - Allegro grasp 中 ff/rf、base/proximal 或非白名单 link 接触。
 
@@ -94,9 +105,10 @@ full-collision top-entry 路线。
 2 backends × 5 seeds × 4 primitives × 3 targets = 120 runs
 ```
 
-每次成功都要求物理量排序正确、非法接触峰值为零、穿透不越界、grasp 脱离支撑且
-最终安全放回。另有两个关键负例：partial-collision Allegro heft 必须拒绝；将候选间距
-压到 70 mm 时，邻物接触必须导致 `other_object_collision`，不能仍返回 `ok`。
+每次成功都要求刚度/质量/摩擦排序正确；等质量 content-mobility 的三类动态响应可分，
+方向由 backend-specific calibration 解释。其余要求包括非法接触峰值为零、穿透不越界、
+grasp 真实脱离支撑且最终安全放回。负例还覆盖 partial-collision、最大 wrist travel
+耗尽、failed grasp 和 70 mm 候选间距造成的邻物接触。
 
 对应测试入口：
 
